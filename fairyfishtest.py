@@ -158,7 +158,7 @@ class Game:
                 self.moves.append(engine.get_move())
             end_time = time.time()
             self.clock_times[idx] += self.time_control.increment - (end_time - start_time)
-            logging.debug('Position: {}, Move: {}'.format(sf.get_fen(self.variant, self.get_start_fen(), self.moves),
+            logging.debug('Position: {}, Move: {}'.format(sf.get_fen(self.variant, self.get_start_fen(), self.moves[:-1]),
                                                           self.moves[-1]))
             if self.partner:
                 captured = self.get_captured()
