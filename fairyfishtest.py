@@ -118,6 +118,10 @@ class Game:
             engine.initialize()
             engine.newgame(self.variant, self.time_control)
 
+    def is_legal(self):
+        assert self.moves
+        return self.moves[-1] in sf.legal_moves(self.variant, self.get_start_fen(), self.moves[:-1])
+
     def is_game_end(self):
         with self.lock:
             game_end = False
@@ -126,7 +130,7 @@ class Game:
                 logging.warning('Engine {} loses on time.'.format((len(self.moves) - 1) % 2 + 1))
                 result = 1
                 game_end = True
-            elif self.moves and self.moves[-1] not in sf.legal_moves(self.variant, self.get_start_fen(), self.moves[:-1]):
+            elif self.moves and not self.is_legal():
                 # last move was illegal
                 result = 1
                 game_end = True
@@ -160,7 +164,7 @@ class Game:
             self.clock_times[idx] += self.time_control.increment - (end_time - start_time)
             logging.debug('Position: {}, Move: {}'.format(sf.get_fen(self.variant, self.get_start_fen(), self.moves[:-1]),
                                                           self.moves[-1]))
-            if self.partner:
+            if self.partner and self.is_legal():
                 captured = self.get_captured()
                 if captured:
                     self.partner.set_holdings(captured)
