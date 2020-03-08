@@ -33,6 +33,7 @@ class Engine:
     def __init__(self, args):
         self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True)
         self.lock = threading.Lock()
+        self.partner = None
 
     def initialize(self):
         with self.lock:
@@ -61,11 +62,17 @@ class Engine:
     def get_move(self):
         while True:
             l = self.process.stdout.readline()
-            # TODO: communicate ptell
+            if self.partner and l.startswith('tellics ptell'):
+                self.partner.ptell(l.strip().split(None, 2)[2])
             if l.startswith('move'):
                 return l.strip().split()[1]
             if l.startswith(('1-0', '0-1', '1/2-1/2')):
                 return None
+
+    def ptell(self, message):
+        with self.lock:
+            self.process.stdin.write('ptell {}\n'.format(message))
+            self.process.stdin.flush()
 
     def holding(self, holding):
         with self.lock:
@@ -224,6 +231,10 @@ class Match:
                          self.variant, random.choice(self.start_fens))
             game.partner = game2
             game2.partner = game
+            self.engines[0].partner = self.board2_engines[0]
+            self.engines[1].partner = self.board2_engines[1]
+            self.board2_engines[0].partner = self.engines[0]
+            self.board2_engines[1].partner = self.engines[1]
             thread2 = threading.Thread(target=game2.play, daemon=True)
             thread2.start()
         game.play()
