@@ -193,13 +193,13 @@ class Match:
             result = game.result
         assert result in (1, 0, -1)
         relative_result = -result if flip else result
-        self.score[relative_result] += 1
+        self.score[relative_result - 1] += 1
         logging.debug('Game finished after {} moves.'.format(len(game.moves)))
 
     def run(self):
         while sum(self.score) < self.games:
             self.play_game()
-            logging.info('Score: {}'.format(self.score))
+            logging.info('Total: {} W: {} L: {} D: {}'.format(sum(self.score), *self.score))
 
 
 def main(engine1, engine2, variant, num_games, **kwargs):
