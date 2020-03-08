@@ -24,6 +24,7 @@ import random
 import subprocess
 import sys
 import threading
+import time
 
 import pyffish as sf
 
@@ -39,12 +40,17 @@ class Engine:
             self.process.stdin.write('protover 2\n')
             self.process.stdin.flush()
 
-    def newgame(self, variant):
+    def newgame(self, variant, time_control):
         with self.lock:
             self.process.stdin.write('new\n')
             self.process.stdin.write('variant {}\n'.format(variant))
-            # TODO: implement time management
-            self.process.stdin.write('sd 10\n')
+            self.process.stdin.write('level {}\n'.format(time_control.format_xboard()))
+            self.process.stdin.flush()
+
+    def update_clocks(self, time, opptime):
+        with self.lock:
+            self.process.stdin.write('time {}\n'.format(int(time * 100)))
+            self.process.stdin.write('opptime {}\n'.format(int(opptime * 100)))
             self.process.stdin.flush()
 
     def go(self):
@@ -72,26 +78,55 @@ class Engine:
             self.process.stdin.flush()
 
 
+class TimeControl:
+    def __init__(self, time, increment=0, moves=0):
+        self.time = time
+        self.increment = increment
+        self.moves = moves
+
+    @staticmethod
+    def parse(stringified_tc):
+        time_and_increment = stringified_tc.split('+')
+        moves_and_time = time_and_increment[0].split('/')
+        time = float(moves_and_time[-1])
+        increment = float(time_and_increment[1]) if len(time_and_increment) > 1 else 0
+        moves = int(moves_and_time[0]) if len(moves_and_time) > 1 else 0
+        return TimeControl(time, increment, moves)
+
+    def format_xboard(self):
+        return '{} {}:{} {}'.format(self.moves, int(self.time // 60), int(self.time % 60), int(self.increment))
+
+    def __str__(self):
+        return ('{}/'.format(self.moves) if self.moves else '') + '{}+{}'.format(self.time, self.increment)
+
+
 class Game:
-    def __init__(self, engine1, engine2, variant='chess', start_fen=None):
+    def __init__(self, engine1, engine2, time_control, variant='chess', start_fen=None):
         self.engines = [engine1, engine2]
+        self.time_control = time_control
         self.variant = variant
         self.start_fen = start_fen or sf.start_fen(variant)
         self.moves = []
         self.result = None
         self.partner = None
         self.obtained_holdings = ''
+        self.clock_times = [self.time_control.time, self.time_control.time]
         self.lock = threading.RLock()
 
     def initialize(self):
         for engine in self.engines:
             engine.initialize()
-            engine.newgame(self.variant)
+            engine.newgame(self.variant, self.time_control)
 
     def is_game_end(self):
         with self.lock:
             game_end = False
-            if self.moves and self.moves[-1] not in sf.legal_moves(self.variant, self.get_start_fen(), self.moves[:-1]):
+            if self.clock_times[(len(self.moves) - 1) % 2] <= 0:
+                # time loss
+                logging.warning('Engine {} loses on time.'.format((len(self.moves) - 1) % 2 + 1))
+                result = 1
+                game_end = True
+            elif self.moves and self.moves[-1] not in sf.legal_moves(self.variant, self.get_start_fen(), self.moves[:-1]):
                 # last move was illegal
                 result = 1
                 game_end = True
@@ -114,10 +149,15 @@ class Game:
     def play(self):
         self.initialize()
         while not self.is_game_end() and not (self.partner and self.partner.is_game_end()):
-            engine = self.engines[len(self.moves) % 2]
+            idx = len(self.moves) % 2
+            engine = self.engines[idx]
+            engine.update_clocks(self.clock_times[idx], self.clock_times[idx - 1])
             engine.usermove(self.moves[-1]) if self.moves else engine.go()
+            start_time = time.time()
             with self.lock:
                 self.moves.append(engine.get_move())
+            end_time = time.time()
+            self.clock_times[idx] += self.time_control.increment - (end_time - start_time)
             logging.debug('Position: {}, Move: {}'.format(sf.get_fen(self.variant, self.get_start_fen(), self.moves),
                                                           self.moves[-1]))
             if self.partner:
@@ -161,10 +201,11 @@ class Game:
             engine.holding(xboard_holdings)
 
 class Match:
-    def __init__(self, engine1, engine2, variant='chess', games=1, start_fens=None):
+    def __init__(self, engine1, engine2, time_control, variant='chess', games=1, start_fens=None):
         self.two_boards = variant in ('bughouse', 'koedem', 'supply') # TODO: use sf.twoBoards
         self.engines = [Engine([engine1]), Engine([engine2])]
         self.board2_engines = [Engine([engine1]), Engine([engine2])] if self.two_boards else None
+        self.time_control = time_control
         self.variant = variant
         self.games = games
         self.start_fens = start_fens if start_fens else [sf.start_fen(variant)]
@@ -172,10 +213,10 @@ class Match:
 
     def play_game(self):
         flip = sum(self.score) % 2
-        game = Game(self.engines[flip], self.engines[not flip],
+        game = Game(self.engines[flip], self.engines[not flip], self.time_control,
                     self.variant, random.choice(self.start_fens))
         if self.two_boards:
-            game2 = Game(self.board2_engines[not flip], self.board2_engines[flip],
+            game2 = Game(self.board2_engines[not flip], self.board2_engines[flip], self.time_control,
                          self.variant, random.choice(self.start_fens))
             game.partner = game2
             game2.partner = game
@@ -202,21 +243,29 @@ class Match:
             logging.info('Total: {} W: {} L: {} D: {}'.format(sum(self.score), *self.score))
 
 
-def main(engine1, engine2, variant, num_games, **kwargs):
-    match = Match(engine1, engine2, variant, num_games)
+def main(engine1, engine2, time_control, variant, num_games, **kwargs):
+    match = Match(engine1, engine2, time_control, variant, num_games)
     match.run()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('engine1', help='path to first engine', type=str)
-    parser.add_argument('engine2', help='path to second engine', type=str)
-    parser.add_argument('-v', '--variant', help='variant name', type=str, default='chess')
-    parser.add_argument('-n', '--num-games', help='maximum number of games', type=int, default=3)
-    parser.add_argument('-l', '--log-level', help='logging level', default='INFO')
+    parser.add_argument('engine1', help='path to first engine')
+    parser.add_argument('engine2', help='path to second engine')
+    parser.add_argument('-t', '--time-control', type=str, default='10+0',
+                        help='Time control in format moves/time+increment')
+    parser.add_argument('-v', '--variant', default='chess', help='variant name')
+    parser.add_argument('-n', '--num-games', type=int, default=1000, help='maximum number of games')
+    parser.add_argument('-l', '--log-level', default='INFO', help='logging level')
     args = parser.parse_args()
     numeric_level = getattr(logging, args.log_level.upper(), None)
     if not isinstance(numeric_level, int):
         parser.error('Invalid log level: {}'.format(args.log_level))
+    try:
+        args.time_control = TimeControl.parse(args.time_control)
+    except Exception:
+        parser.error('Invalid time control: {}'.format(args.time_control))
+    if args.time_control.moves:  # TODO: support epochs
+        parser.error('Time control not supported: {}'.format(args.time_control))
     logging.basicConfig(level=numeric_level, format='%(message)s')
     main(**vars(args))
