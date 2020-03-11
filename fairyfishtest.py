@@ -45,13 +45,16 @@ class Engine:
         with self.lock:
             self.process.stdin.write('new\n')
             self.process.stdin.write('variant {}\n'.format(variant))
+            if self.partner:
+                self.process.stdin.write('partner test\n')
             self.process.stdin.write('level {}\n'.format(time_control.format_xboard()))
             self.process.stdin.flush()
 
-    def update_clocks(self, time, opptime):
+    def update_clocks(self, time, otim):
         with self.lock:
+            # times in centiseconds
             self.process.stdin.write('time {}\n'.format(int(time * 100)))
-            self.process.stdin.write('opptime {}\n'.format(int(opptime * 100)))
+            self.process.stdin.write('otim {}\n'.format(int(otim * 100)))
             self.process.stdin.flush()
 
     def go(self):
