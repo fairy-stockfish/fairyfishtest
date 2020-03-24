@@ -34,6 +34,7 @@ class Engine:
         self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True)
         self.lock = threading.Lock()
         self.partner = None
+        self.rank_conversion = False  # convert ranks from zero-based to one-based
 
     def initialize(self):
         with self.lock:
@@ -43,6 +44,7 @@ class Engine:
 
     def newgame(self, variant, time_control):
         with self.lock:
+            self.rank_conversion = sf.start_fen(variant).count('/') + 1 == 10
             self.process.stdin.write('new\n')
             self.process.stdin.write('variant {}\n'.format(variant))
             if self.partner:
@@ -68,9 +70,29 @@ class Engine:
             if self.partner and l.startswith('tellics ptell'):
                 self.partner.ptell(l.strip().split(None, 2)[2])
             if l.startswith('move'):
-                return l.strip().split()[1]
+                return self.move_to_uci(l.strip().split()[1], self.rank_conversion)
             if l.startswith(('1-0', '0-1', '1/2-1/2')):
                 return None
+
+    @staticmethod
+    def move_to_uci(move, rank_conversion):
+        if rank_conversion and move:
+            square1 = move[0] + str(int(move[1]) + 1) if move[1].isnumeric() else move[0:2]
+            square2 = move[2] + str(int(move[3]) + 1) if move[3].isnumeric() else move[2:4]
+            return square1 + square2 + move[4:]
+        else:
+            return move
+
+    @staticmethod
+    def move_from_uci(move, rank_conversion):
+        if rank_conversion and move and len(move) >= 4:
+            len1 = 2 + move[2].isnumeric()
+            len2 = 2 + (len(move) > len1 + 2 and move[len1 + 2].isnumeric())
+            square1 = move[0] + str(int(move[1:len1]) - 1) if move[1:len1].isnumeric() else move[0:len1]
+            square2 = move[len1] + str(int(move[len1 + 1:len1 + len2]) - 1) if move[len1 + 1:len1 + len2].isnumeric() else move[len1 + 1:len1 + len2]
+            return square1 + square2 + move[len1 + len2:]
+        else:
+            return move
 
     def ptell(self, message):
         with self.lock:
@@ -84,7 +106,7 @@ class Engine:
 
     def usermove(self, move):
         with self.lock:
-            self.process.stdin.write('usermove {}\n'.format(move))
+            self.process.stdin.write('usermove {}\n'.format(self.move_from_uci(move, self.rank_conversion)))
             self.process.stdin.flush()
 
 
