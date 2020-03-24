@@ -146,14 +146,8 @@ class Game:
                 game_end = True
                 logging.error('Illegal move: {}'.format(self.moves[-1]))
             elif not sf.legal_moves(self.variant, self.get_start_fen(), self.moves):
-                game_end, result = sf.is_immediate_game_end(self.variant, self.get_start_fen(), self.moves)
-                if not game_end:
-                    # TODO: handle conditional checkmate, and non-standard checkmate and stalemate values
-                    if sf.gives_check(self.variant, self.get_start_fen(), self.moves):
-                        result = -1
-                    else:
-                        result = 0
-                    game_end = True
+                game_end = True
+                result = sf.game_result(self.variant, self.get_start_fen(), self.moves)
             else:
                 game_end, result = sf.is_optional_game_end(self.variant, self.get_start_fen(), self.moves)
             if game_end:
@@ -216,7 +210,7 @@ class Game:
 
 class Match:
     def __init__(self, engine1, engine2, time_control, variant='chess', games=1, start_fens=None):
-        self.two_boards = variant in ('bughouse', 'koedem', 'supply') # TODO: use sf.twoBoards
+        self.two_boards = sf.two_boards(variant)
         self.engines = [Engine([engine1]), Engine([engine2])]
         self.board2_engines = [Engine([engine1]), Engine([engine2])] if self.two_boards else None
         self.time_control = time_control
