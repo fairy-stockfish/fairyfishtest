@@ -1,6 +1,6 @@
 # fairyfishtest
 
-[![Build Status](https://travis-ci.org/ianfab/fairyfishtest.svg?branch=master)](https://travis-ci.org/ianfab/fairyfishtest)
+[![Build Status](https://github.com/ianfab/fairyfishtest/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/ianfab/fairyfishtest/actions/workflows/test.yml?query=branch%3Amaster)
 
 Fairyfishtest is a script for automated chess variant engine matches based on the [python wrapper](https://github.com/gbtami/Fairy-Stockfish) for [Fairy-Stockfish](https://github.com/ianfab/Fairy-Stockfish).
 
