@@ -2,6 +2,7 @@ import unittest
 
 import fairyfishtest
 
+
 class TestFairyFishTest(unittest.TestCase):
     def test_parse_time_control(self):
         tc = fairyfishtest.TimeControl.parse('10/20+3')

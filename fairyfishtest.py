@@ -22,7 +22,6 @@ import logging
 import math
 import random
 import subprocess
-import sys
 import threading
 import time
 
@@ -66,12 +65,12 @@ class Engine:
 
     def get_move(self):
         while True:
-            l = self.process.stdout.readline()
-            if self.partner and l.startswith('tellics ptell'):
-                self.partner.ptell(l.strip().split(None, 2)[2])
-            if l.startswith('move'):
-                return self.move_to_uci(l.strip().split()[1], self.rank_conversion)
-            if l.startswith(('1-0', '0-1', '1/2-1/2')):
+            line = self.process.stdout.readline()
+            if self.partner and line.startswith('tellics ptell'):
+                self.partner.ptell(line.strip().split(None, 2)[2])
+            if line.startswith('move'):
+                return self.move_to_uci(line.strip().split()[1], self.rank_conversion)
+            if line.startswith(('1-0', '0-1', '1/2-1/2')):
                 return None
 
     @staticmethod
@@ -89,7 +88,8 @@ class Engine:
             len1 = 2 + move[2].isnumeric()
             len2 = 2 + (len(move) > len1 + 2 and move[len1 + 2].isnumeric())
             square1 = move[0] + str(int(move[1:len1]) - 1) if move[1:len1].isnumeric() else move[0:len1]
-            square2 = move[len1] + str(int(move[len1 + 1:len1 + len2]) - 1) if move[len1 + 1:len1 + len2].isnumeric() else move[len1 + 1:len1 + len2]
+            square2 = (move[len1] + str(int(move[len1 + 1:len1 + len2]) - 1)
+                       if move[len1 + 1:len1 + len2].isnumeric() else move[len1 + 1:len1 + len2])
             return square1 + square2 + move[len1 + len2:]
         else:
             return move
@@ -229,6 +229,7 @@ class Game:
         logging.debug('holding {}'.format(xboard_holdings))
         for engine in self.engines:
             engine.holding(xboard_holdings)
+
 
 class Match:
     def __init__(self, engine1, engine2, time_control, variant='chess', games=1, start_fens=None):
