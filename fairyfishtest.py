@@ -29,16 +29,19 @@ import pyffish as sf
 
 
 class Engine:
-    def __init__(self, args):
+    def __init__(self, args, options):
         self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True)
         self.lock = threading.Lock()
         self.partner = None
         self.rank_conversion = False  # convert ranks from zero-based to one-based
+        self.options = options
 
     def initialize(self):
         with self.lock:
             self.process.stdin.write('xboard\n')
             self.process.stdin.write('protover 2\n')
+            for option, value in self.options.items():
+                self.process.stdin.write('option {}={}\n'.format(option, value))
             self.process.stdin.flush()
 
     def newgame(self, variant, time_control):
@@ -232,10 +235,10 @@ class Game:
 
 
 class Match:
-    def __init__(self, engine1, engine2, time_control, variant='chess', games=1, start_fens=None):
+    def __init__(self, engine1, engine2, e1_options, e2_options, time_control, variant='chess', games=1, start_fens=None):
         self.two_boards = sf.two_boards(variant)
-        self.engines = [Engine([engine1]), Engine([engine2])]
-        self.board2_engines = [Engine([engine1]), Engine([engine2])] if self.two_boards else None
+        self.engines = [Engine([engine1], e1_options), Engine([engine2], e2_options)]
+        self.board2_engines = [Engine([engine1], e1_options), Engine([engine2], e2_options)] if self.two_boards else None
         self.time_control = time_control
         self.variant = variant
         self.games = games
@@ -278,8 +281,8 @@ class Match:
             logging.info('Total: {} W: {} L: {} D: {}'.format(sum(self.score), *self.score))
 
 
-def main(engine1, engine2, time_control, variant, num_games, **kwargs):
-    match = Match(engine1, engine2, time_control, variant, num_games)
+def main(engine1, engine2, e1_options, e2_options, time_control, variant, num_games, **kwargs):
+    match = Match(engine1, engine2, dict(e1_options), dict(e2_options), time_control, variant, num_games)
     match.run()
 
 
@@ -287,6 +290,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('engine1', help='path to first engine')
     parser.add_argument('engine2', help='path to second engine')
+    parser.add_argument('--e1-options', help='options for first UCI engine', type=lambda kv: kv.split('='), action='append', default=[])
+    parser.add_argument('--e2-options', help='options for second UCI engine', type=lambda kv: kv.split('='), action='append', default=[])
     parser.add_argument('-t', '--time-control', type=str, default='10+0',
                         help='Time control in format moves/time+increment')
     parser.add_argument('-v', '--variant', default='chess', help='variant name')
