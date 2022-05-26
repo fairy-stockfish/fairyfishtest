@@ -78,7 +78,9 @@ class Engine:
 
     @staticmethod
     def move_to_uci(move, rank_conversion):
-        if rank_conversion and move:
+        if move == '@@@@':
+            return '0000'
+        elif rank_conversion and move:
             square1 = move[0] + str(int(move[1]) + 1) if move[1].isnumeric() else move[0:2]
             square2 = move[2] + str(int(move[3]) + 1) if move[3].isnumeric() else move[2:4]
             return square1 + square2 + move[4:]
@@ -87,7 +89,9 @@ class Engine:
 
     @staticmethod
     def move_from_uci(move, rank_conversion):
-        if rank_conversion and move and len(move) >= 4:
+        if len(move) % 2 == 0 and move[:len(move) // 2] == move[len(move) // 2:]:
+            return '@@@@'
+        elif rank_conversion and move and len(move) >= 4:
             len1 = 2 + move[2].isnumeric()
             len2 = 2 + (len(move) > len1 + 2 and move[len1 + 2].isnumeric())
             square1 = move[0] + str(int(move[1:len1]) - 1) if move[1:len1].isnumeric() else move[0:len1]
@@ -189,6 +193,12 @@ class Game:
             start_time = time.time()
             with self.lock:
                 self.moves.append(engine.get_move())
+            # woraround for e1e1-style passing moves
+            if self.moves[-1] == '0000':
+                moves = sf.legal_moves(self.variant, self.get_start_fen(), self.moves[:-1])
+                pass_candidates = [move for move in moves if Engine.move_from_uci(move, False) == '@@@@']
+                if len(pass_candidates) == 1:
+                    self.moves[-1] = pass_candidates[0]
             end_time = time.time()
             self.clock_times[idx] += self.time_control.increment - (end_time - start_time)
             logging.debug('Position: {}, Move: {}'.format(sf.get_fen(self.variant, self.get_start_fen(), self.moves[:-1]),

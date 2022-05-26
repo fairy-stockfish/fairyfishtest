@@ -35,6 +35,7 @@ class TestFairyFishTest(unittest.TestCase):
         self.assertEqual(fairyfishtest.Engine.move_to_uci('a9b9', True), 'a10b10')
         self.assertEqual(fairyfishtest.Engine.move_to_uci('a0a1', True), 'a1a2')
         self.assertEqual(fairyfishtest.Engine.move_to_uci('P@e5', True), 'P@e6')
+        self.assertEqual(fairyfishtest.Engine.move_to_uci('@@@@', True), '0000')
 
     def test_from_uci(self):
         self.assertEqual(fairyfishtest.Engine.move_from_uci('a1a2', False), 'a1a2')
@@ -42,6 +43,8 @@ class TestFairyFishTest(unittest.TestCase):
         self.assertEqual(fairyfishtest.Engine.move_from_uci('a10b10', True), 'a9b9')
         self.assertEqual(fairyfishtest.Engine.move_from_uci('a1a2', True), 'a0a1')
         self.assertEqual(fairyfishtest.Engine.move_from_uci('P@e6', True), 'P@e5')
+        self.assertEqual(fairyfishtest.Engine.move_from_uci('0000', True), '@@@@')
+        self.assertEqual(fairyfishtest.Engine.move_from_uci('e1e1', True), '@@@@')
 
 
 if __name__ == '__main__':
