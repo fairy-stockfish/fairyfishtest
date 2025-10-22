@@ -1,1 +1,1 @@
-pyffish==0.0.72
+pyffish==0.0.88
