@@ -28,6 +28,107 @@ import time
 import pyffish as sf
 
 
+# SPRT (Sequential Probability Ratio Test) statistical functions
+def erf(x):
+    """Error function approximation for SPRT calculations"""
+    a = 8 * (math.pi - 3) / (3 * math.pi * (4 - math.pi))
+    x2 = x * x
+    y = -x2 * (4 / math.pi + a * x2) / (1 + a * x2)
+    return math.copysign(math.sqrt(1 - math.exp(y)), x)
+
+
+def erf_inv(x):
+    """Inverse error function for SPRT calculations"""
+    a = 8 * (math.pi - 3) / (3 * math.pi * (4 - math.pi))
+    y = math.log(1 - x * x)
+    z = 2 / (math.pi * a) + y / 2
+    return math.copysign(math.sqrt(math.sqrt(z * z - y / a) - z), x)
+
+
+def phi(q):
+    """Cumulative distribution function for the standard Gaussian law"""
+    return 0.5 * (1 + erf(q / math.sqrt(2)))
+
+
+def phi_inv(p):
+    """Quantile function for the standard Gaussian law"""
+    assert (0 <= p <= 1)
+    return math.sqrt(2) * erf_inv(2 * p - 1)
+
+
+def elo(x):
+    """Convert win rate to ELO"""
+    if x <= 0:
+        return 0.0
+    return -400 * math.log10(1 / x - 1)
+
+
+def bayeselo_to_proba(elo, drawelo):
+    """Convert BayesELO to probabilities"""
+    P = {}
+    P['win'] = 1.0 / (1.0 + pow(10.0, (-elo + drawelo) / 400.0))
+    P['loss'] = 1.0 / (1.0 + pow(10.0, (elo + drawelo) / 400.0))
+    P['draw'] = 1.0 - P['win'] - P['loss']
+    return P
+
+
+def proba_to_bayeselo(P):
+    """Convert probabilities to BayesELO"""
+    assert (0 < P['win'] < 1 and 0 < P['loss'] < 1)
+    elo = 200 * math.log10(P['win'] / P['loss'] * (1 - P['loss']) / (1 - P['win']))
+    drawelo = 200 * math.log10((1 - P['loss']) / P['loss'] * (1 - P['win']) / P['win'])
+    return elo, drawelo
+
+
+def SPRT(R, elo0, alpha, elo1, beta, drawelo):
+    """Sequential Probability Ratio Test
+    
+    Args:
+        R: dict with 'wins', 'losses', 'draws' counts
+        elo0: null hypothesis ELO
+        alpha: max type I error
+        elo1: alternative hypothesis ELO  
+        beta: max type II error
+        drawelo: draw ELO
+        
+    Returns:
+        dict with 'finished', 'state', 'llr', 'lower_bound', 'upper_bound'
+    """
+    result = {
+        'finished': False,
+        'state': '',
+        'llr': 0.0,
+        'lower_bound': math.log(beta / (1 - alpha)),
+        'upper_bound': math.log((1 - beta) / alpha),
+    }
+
+    # Estimate drawelo out of sample
+    if R['wins'] > 0 and R['losses'] > 0 and R['draws'] > 0:
+        N = R['wins'] + R['losses'] + R['draws']
+        P = {'win': float(R['wins']) / N, 'loss': float(R['losses']) / N, 'draw': float(R['draws']) / N}
+        elo, drawelo = proba_to_bayeselo(P)
+    else:
+        return result
+
+    # Probability laws under H0 and H1
+    P0 = bayeselo_to_proba(elo0, drawelo)
+    P1 = bayeselo_to_proba(elo1, drawelo)
+
+    # Log-Likelihood Ratio
+    result['llr'] = (R['wins'] * math.log(P1['win'] / P0['win']) + 
+                     R['losses'] * math.log(P1['loss'] / P0['loss']) + 
+                     R['draws'] * math.log(P1['draw'] / P0['draw']))
+
+    if result['llr'] < result['lower_bound']:
+        result['finished'] = True
+        result['state'] = 'rejected'
+    elif result['llr'] > result['upper_bound']:
+        result['finished'] = True
+        result['state'] = 'accepted'
+
+    return result
+
+
 class Engine:
     def __init__(self, args, options):
         self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True)
@@ -245,7 +346,7 @@ class Game:
 
 
 class Match:
-    def __init__(self, engine1, engine2, e1_options, e2_options, time_control, variant='chess', games=1, start_fens=None):
+    def __init__(self, engine1, engine2, e1_options, e2_options, time_control, variant='chess', games=1, start_fens=None, sprt_params=None):
         self.two_boards = sf.two_boards(variant)
         self.engines = [Engine([engine1], e1_options), Engine([engine2], e2_options)]
         self.board2_engines = [Engine([engine1], e1_options), Engine([engine2], e2_options)] if self.two_boards else None
@@ -253,7 +354,9 @@ class Match:
         self.variant = variant
         self.games = games
         self.start_fens = start_fens if start_fens else [sf.start_fen(variant)]
-        self.score = [0, 0, 0]
+        self.score = [0, 0, 0]  # [losses, draws, wins] for engine1 vs engine2
+        self.sprt_params = sprt_params
+        self.sprt_result = None
 
     def play_game(self):
         flip = sum(self.score) % 2
@@ -289,10 +392,46 @@ class Match:
         while sum(self.score) < self.games:
             self.play_game()
             logging.info('Total: {} W: {} L: {} D: {}'.format(sum(self.score), *self.score))
+            
+            # Check SPRT termination conditions
+            if self.sprt_params and sum(self.score) >= 3:  # Need at least 3 games for SPRT
+                R = {
+                    'wins': self.score[2],      # wins for engine1
+                    'losses': self.score[0],    # losses for engine1
+                    'draws': self.score[1]      # draws
+                }
+                self.sprt_result = SPRT(R, **self.sprt_params)
+                
+                if self.sprt_result['finished']:
+                    logging.info('SPRT finished: {} (LLR: {:.3f}, bounds: [{:.3f}, {:.3f}])'.format(
+                        self.sprt_result['state'], 
+                        self.sprt_result['llr'],
+                        self.sprt_result['lower_bound'],
+                        self.sprt_result['upper_bound']
+                    ))
+                    break
+                else:
+                    logging.debug('SPRT continuing: LLR: {:.3f}, bounds: [{:.3f}, {:.3f}]'.format(
+                        self.sprt_result['llr'],
+                        self.sprt_result['lower_bound'],
+                        self.sprt_result['upper_bound']
+                    ))
 
 
-def main(engine1, engine2, e1_options, e2_options, time_control, variant, num_games, **kwargs):
-    match = Match(engine1, engine2, dict(e1_options), dict(e2_options), time_control, variant, num_games)
+def main(engine1, engine2, e1_options, e2_options, time_control, variant, num_games, sprt_elo0=None, sprt_elo1=None, sprt_alpha=None, sprt_beta=None, sprt_drawelo=None, **kwargs):
+    sprt_params = None
+    if all(x is not None for x in [sprt_elo0, sprt_elo1, sprt_alpha, sprt_beta, sprt_drawelo]):
+        sprt_params = {
+            'elo0': sprt_elo0,
+            'elo1': sprt_elo1,
+            'alpha': sprt_alpha,
+            'beta': sprt_beta,
+            'drawelo': sprt_drawelo
+        }
+        logging.info('Using SPRT with parameters: H0={}, H1={}, alpha={}, beta={}, drawelo={}'.format(
+            sprt_elo0, sprt_elo1, sprt_alpha, sprt_beta, sprt_drawelo))
+    
+    match = Match(engine1, engine2, dict(e1_options), dict(e2_options), time_control, variant, num_games, sprt_params=sprt_params)
     match.run()
 
 
@@ -307,6 +446,14 @@ if __name__ == '__main__':
     parser.add_argument('-v', '--variant', default='chess', help='variant name')
     parser.add_argument('-n', '--num-games', type=int, default=1000, help='maximum number of games')
     parser.add_argument('-l', '--log-level', default='INFO', help='logging level')
+    
+    # SPRT arguments
+    parser.add_argument('--sprt-elo0', type=float, help='SPRT null hypothesis ELO (H0)')
+    parser.add_argument('--sprt-elo1', type=float, help='SPRT alternative hypothesis ELO (H1)')
+    parser.add_argument('--sprt-alpha', type=float, help='SPRT maximum Type I error rate')
+    parser.add_argument('--sprt-beta', type=float, help='SPRT maximum Type II error rate')
+    parser.add_argument('--sprt-drawelo', type=float, help='SPRT draw ELO')
+    
     args = parser.parse_args()
     numeric_level = getattr(logging, args.log_level.upper(), None)
     if not isinstance(numeric_level, int):
@@ -317,5 +464,12 @@ if __name__ == '__main__':
         parser.error('Invalid time control: {}'.format(args.time_control))
     if args.time_control.moves:  # TODO: support epochs
         parser.error('Time control not supported: {}'.format(args.time_control))
+    
+    # Validate SPRT parameters
+    sprt_args = [args.sprt_elo0, args.sprt_elo1, args.sprt_alpha, args.sprt_beta, args.sprt_drawelo]
+    sprt_provided = sum(1 for x in sprt_args if x is not None)
+    if sprt_provided > 0 and sprt_provided != 5:
+        parser.error('All SPRT parameters must be provided together: --sprt-elo0, --sprt-elo1, --sprt-alpha, --sprt-beta, --sprt-drawelo')
+    
     logging.basicConfig(level=numeric_level, format='%(message)s')
     main(**vars(args))
