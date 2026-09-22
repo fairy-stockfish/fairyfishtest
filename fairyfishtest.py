@@ -18,8 +18,10 @@
 
 import argparse
 from collections import Counter
+import contextlib
 import logging
 import math
+import os
 import queue
 import random
 import subprocess
@@ -35,7 +37,7 @@ MOVE_TIMEOUT_GRACE = 10
 
 
 class Engine:
-    def __init__(self, args, options):
+    def __init__(self, args, options, name=None):
         self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True)
         self.lock = threading.Lock()
         self.partner = None
@@ -46,7 +48,8 @@ class Engine:
         # happen to be waiting for this engine's move, and so that the pipe
         # never fills up while the engine is idle.
         self.replies = queue.Queue()
-        self.reader = threading.Thread(target=self._read_loop, daemon=True)
+        self.reader = threading.Thread(target=self._read_loop, daemon=True,
+                                       name='{}:reader'.format(name) if name else None)
         self.reader.start()
 
     def initialize(self):
@@ -385,16 +388,60 @@ class Game:
             engine.holding(xboard_holdings)
 
 
+class Scoreboard:
+    """The W/L/D counters and the stop condition shared by all concurrent matches.
+
+    Matches claim the games they are about to play via reserve(), so that
+    running several of them concurrently never overshoots the requested number.
+    """
+
+    def __init__(self, games):
+        self.games = games
+        self.score = [0, 0, 0]
+        self.reserved = 0
+        self.stopped = False
+        self.lock = threading.Lock()
+
+    def reserve(self, count):
+        """Claims up to count games and returns how many were granted."""
+        with self.lock:
+            granted = 0 if self.stopped else max(min(count, self.games - self.reserved), 0)
+            self.reserved += granted
+            return granted
+
+    def release(self, count):
+        """Returns games claimed but not played, e.g. after an aborted match."""
+        with self.lock:
+            self.reserved -= count
+
+    def record(self, result):
+        with self.lock:
+            self.score[result - 1] += 1
+            score = list(self.score)
+        logging.info('Total: {} W: {} L: {} D: {}'.format(sum(score), *score))
+
+    def stop(self):
+        """Keeps the matches from starting further games."""
+        with self.lock:
+            self.stopped = True
+
+
 class Match:
-    def __init__(self, engine1, engine2, e1_options, e2_options, time_control, variant='chess', games=1, start_fens=None):
+    def __init__(self, engine1, engine2, e1_options, e2_options, time_control, variant='chess',
+                 scoreboard=None, start_fens=None, name='match'):
         self.two_boards = sf.two_boards(variant)
-        self.engines = [Engine([engine1], e1_options), Engine([engine2], e2_options)]
-        self.board2_engines = [Engine([engine1], e1_options), Engine([engine2], e2_options)] if self.two_boards else None
+        self.name = name
+        # The names end up on the engines' reader threads, so that the log of a
+        # concurrent run says which match and board a line belongs to.
+        self.engines = [Engine([engine1], e1_options, '{}:b1e1'.format(name)),
+                        Engine([engine2], e2_options, '{}:b1e2'.format(name))]
+        self.board2_engines = ([Engine([engine1], e1_options, '{}:b2e1'.format(name)),
+                                Engine([engine2], e2_options, '{}:b2e2'.format(name))]
+                               if self.two_boards else None)
         self.time_control = time_control
         self.variant = variant
-        self.games = games
+        self.scoreboard = scoreboard if scoreboard is not None else Scoreboard(1)
         self.start_fens = start_fens if start_fens else [sf.start_fen(variant)]
-        self.score = [0, 0, 0]
         for engine in self.all_engines():
             engine.initialize()
 
@@ -412,13 +459,13 @@ class Match:
         self.close()
         return False
 
-    def play_game(self):
-        flip = sum(self.score) % 2
+    def play_game(self, flip, start_fens):
+        """Plays one game and returns its result from engine 1's point of view."""
         game = Game(self.engines[flip], self.engines[not flip], self.time_control,
-                    self.variant, random.choice(self.start_fens))
+                    self.variant, start_fens[0])
         if self.two_boards:
             game2 = Game(self.board2_engines[not flip], self.board2_engines[flip], self.time_control,
-                         self.variant, random.choice(self.start_fens))
+                         self.variant, start_fens[1])
             game.partner = game2
             game2.partner = game
             self.engines[0].partner = self.board2_engines[0]
@@ -434,7 +481,8 @@ class Match:
                     logging.exception('Board 2 failed')
                     board2_error.append(e)
 
-            thread2 = threading.Thread(target=play_board2, daemon=True)
+            thread2 = threading.Thread(target=play_board2, daemon=True,
+                                       name='{}:board2'.format(self.name))
             thread2.start()
         game.play()
         if self.two_boards:
@@ -456,20 +504,80 @@ class Match:
         else:
             result = game.result
         assert result in (1, 0, -1)
-        relative_result = -result if flip else result
-        self.score[relative_result - 1] += 1
         logging.debug('Game finished after {} moves.'.format(len(game.moves)))
+        return -result if flip else result
 
     def run(self):
-        while sum(self.score) < self.games:
-            self.play_game()
-            logging.info('Total: {} W: {} L: {} D: {}'.format(sum(self.score), *self.score))
+        """Plays games until the scoreboard is exhausted.
+
+        Games are played in pairs from the same start positions with the colors
+        swapped, so that neither engine benefits from a lopsided opening.
+        """
+        while True:
+            games = self.scoreboard.reserve(2)
+            if not games:
+                break
+            start_fens = [random.choice(self.start_fens) for _ in range(2 if self.two_boards else 1)]
+            for flip in range(games):
+                try:
+                    result = self.play_game(flip, start_fens)
+                except BaseException:
+                    self.scoreboard.release(games - flip)
+                    raise
+                self.scoreboard.record(result)
 
 
-def main(engine1, engine2, e1_options, e2_options, time_control, variant, num_games, **kwargs):
-    time_control.warn_if_inexact()
-    with Match(engine1, engine2, dict(e1_options), dict(e2_options), time_control, variant, num_games) as match:
+def warn_if_oversubscribed(variant, concurrency):
+    """Warns when the concurrent games need more cores than the machine has.
+
+    The clocks are kept in wall clock time and a late reply is counted as a
+    loss on time, so oversubscribing the CPUs does not merely add noise to the
+    result, it decides games.
+    """
+    engines_per_game = 4 if sf.two_boards(variant) else 2
+    processes = engines_per_game * concurrency
+    cpus = os.cpu_count() or 1
+    if processes > cpus:
+        logging.warning('{} concurrent {} games run {} engines but only {} CPUs are available. Engines that '
+                        'do not get a core in time lose on time, which distorts the result. Consider '
+                        '--concurrency {}.'
+                        .format(concurrency, variant, processes, cpus, max(cpus // engines_per_game, 1)))
+
+
+def run_match(match, errors):
+    """Runs one match in its own thread, ending the whole run if it fails."""
+    try:
         match.run()
+    except Exception as e:  # noqa: BLE001 - re-raised in the main thread
+        logging.exception('Match failed')
+        errors.append(e)
+        match.scoreboard.stop()
+
+
+def main(engine1, engine2, e1_options, e2_options, time_control, variant, num_games, concurrency, **kwargs):
+    time_control.warn_if_inexact()
+    warn_if_oversubscribed(variant, concurrency)
+    scoreboard = Scoreboard(num_games)
+    errors = []
+    with contextlib.ExitStack() as stack:
+        threads = []
+        for i in range(concurrency):
+            name = 'match{}'.format(i + 1)
+            match = stack.enter_context(Match(engine1, engine2, dict(e1_options), dict(e2_options),
+                                              time_control, variant, scoreboard, name=name))
+            threads.append(threading.Thread(target=run_match, args=(match, errors), name=name, daemon=True))
+        for thread in threads:
+            thread.start()
+        try:
+            for thread in threads:
+                thread.join()
+        except KeyboardInterrupt:
+            logging.warning('Interrupted, waiting for the games in progress to finish.')
+            scoreboard.stop()
+            for thread in threads:
+                thread.join()
+    if errors:
+        raise errors[0]
 
 
 if __name__ == '__main__':
@@ -482,6 +590,7 @@ if __name__ == '__main__':
                         help='Time control in format moves/time+increment')
     parser.add_argument('-v', '--variant', default='chess', help='variant name')
     parser.add_argument('-n', '--num-games', type=int, default=1000, help='maximum number of games')
+    parser.add_argument('-c', '--concurrency', type=int, default=1, help='number of games to play concurrently')
     parser.add_argument('-l', '--log-level', default='INFO', help='logging level')
     args = parser.parse_args()
     numeric_level = getattr(logging, args.log_level.upper(), None)
@@ -493,5 +602,9 @@ if __name__ == '__main__':
         parser.error('Invalid time control: {}'.format(args.time_control))
     if args.time_control.moves:  # TODO: support epochs
         parser.error('Time control not supported: {}'.format(args.time_control))
-    logging.basicConfig(level=numeric_level, format='%(message)s')
+    if args.concurrency < 1:
+        parser.error('Invalid concurrency: {}'.format(args.concurrency))
+    # Tell the games apart once more than one of them writes to the log
+    log_format = '%(threadName)s: %(message)s' if args.concurrency > 1 else '%(message)s'
+    logging.basicConfig(level=numeric_level, format=log_format)
     main(**vars(args))

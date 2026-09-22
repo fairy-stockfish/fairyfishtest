@@ -62,5 +62,36 @@ class TestBughouse(unittest.TestCase):
         self.assertEqual(self.get_captured('4k3/1P6/8/8/8/8/8/4K2R[] w - - 0 1', ['b7b8q']), '')
 
 
+class TestScoreboard(unittest.TestCase):
+    def test_reserve_does_not_overshoot(self):
+        scoreboard = fairyfishtest.Scoreboard(5)
+        self.assertEqual(scoreboard.reserve(2), 2)
+        self.assertEqual(scoreboard.reserve(2), 2)
+        # only one game is left of the five
+        self.assertEqual(scoreboard.reserve(2), 1)
+        self.assertEqual(scoreboard.reserve(2), 0)
+
+    def test_release(self):
+        scoreboard = fairyfishtest.Scoreboard(2)
+        self.assertEqual(scoreboard.reserve(2), 2)
+        scoreboard.release(1)
+        self.assertEqual(scoreboard.reserve(2), 1)
+
+    def test_stop(self):
+        scoreboard = fairyfishtest.Scoreboard(10)
+        self.assertEqual(scoreboard.reserve(2), 2)
+        scoreboard.stop()
+        self.assertEqual(scoreboard.reserve(2), 0)
+        # a release by a match that is shutting down does not revive the run
+        scoreboard.release(2)
+        self.assertEqual(scoreboard.reserve(2), 0)
+
+    def test_record(self):
+        scoreboard = fairyfishtest.Scoreboard(4)
+        for result in (1, 1, -1, 0):
+            scoreboard.record(result)
+        self.assertEqual(scoreboard.score, [2, 1, 1])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
