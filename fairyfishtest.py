@@ -30,10 +30,16 @@ import time
 
 import pyffish as sf
 
+import stat_util
+
 
 # Grace period on top of the remaining clock before an unresponsive engine is
 # counted as having lost on time.
 MOVE_TIMEOUT_GRACE = 10
+
+# Error rates and the drawelo the SPRT is run with, as in fishtest.
+SPRT_ALPHA = SPRT_BETA = 0.05
+SPRT_DRAWELO = 200
 
 # How often a match replaces the process of an engine that died before it gives
 # up, so that a reproducibly crashing engine does not restart forever.
@@ -124,7 +130,7 @@ class Engine:
         options = ['option {}={}'.format(option, value) for option, value in self.options.items()]
         return self._write('xboard', 'protover 2', *options)
 
-    def newgame(self, variant, time_control):
+    def newgame(self, variant, time_control, start_fen=None):
         # Drop anything the engine may still have said about the previous game,
         # e.g. a move it finished after the game had already been decided.
         while True:
@@ -139,6 +145,13 @@ class Engine:
             'force',
             'new',
             'variant {}'.format(variant),
+            # Park the engine in force mode before setting up the board. 'new'
+            # assigned it a color, and setboard makes it start playing right
+            # away when that color is the one to move, which happens as soon as
+            # an opening book hands out a position with black to move. Each
+            # engine takes over its color when the game sends it 'go'.
+            'force',
+            *(['setboard {}'.format(start_fen)] if start_fen else []),
             *(['partner test'] if self.partner else []),
             'level {}'.format(time_control.format_xboard()))
 
@@ -247,8 +260,14 @@ class Engine:
     def holding(self, holding):
         return self._write('holding {}'.format(holding))
 
-    def usermove(self, move):
-        return self._write('usermove {}'.format(self.move_from_uci(move, self.rank_conversion)))
+    def usermove(self, move, activate=False):
+        """Sends the opponent's move, and with activate the go that answers it.
+
+        The two go together in one write, so that the engine cannot be left
+        sitting in force mode with a move it was never asked to answer.
+        """
+        return self._write('usermove {}'.format(self.move_from_uci(move, self.rank_conversion)),
+                           *(['go'] if activate else []))
 
 
 class TimeControl:
@@ -331,8 +350,14 @@ class Game:
         self.lock = threading.RLock()
 
     def initialize(self):
+        start_fen = self.get_start_fen()
+        # Only set up the board when the game does not start from the variant's
+        # own start position, so that a run without an opening book talks to
+        # the engines exactly as it did before.
+        if start_fen == sf.start_fen(self.variant):
+            start_fen = None
         for engine in self.engines:
-            engine.newgame(self.variant, self.time_control)
+            engine.newgame(self.variant, self.time_control, start_fen)
 
     def is_legal(self):
         assert self.moves
@@ -362,6 +387,9 @@ class Game:
 
     def play(self):
         self.initialize()
+        # Both engines start out in force mode and take over their color on
+        # their first turn, see Engine.newgame.
+        activated = [False, False]
         # The partner board sets its own result, we only have to notice it. Do
         # not evaluate the partner's position from this thread: that used to
         # race with the partner appending its move.
@@ -372,7 +400,11 @@ class Game:
                 clock, opp_clock = self.clock_times[idx], self.clock_times[idx - 1]
             engine = self.engines[idx]
             engine.update_clocks(clock, opp_clock)
-            engine.usermove(last_move) if last_move else engine.go()
+            if last_move:
+                engine.usermove(last_move, activate=not activated[idx])
+            else:
+                engine.go()
+            activated[idx] = True
             start_time = time.time()
             # Never wait for an engine forever, otherwise a hung engine freezes
             # the whole match and the time loss below can never be detected.
@@ -475,6 +507,32 @@ class Game:
             engine.holding(xboard_holdings)
 
 
+def sprt(score, elo0, elo1):
+    """Runs the sequential probability ratio test on a W/L/D score."""
+    return stat_util.SPRT({'wins': score[0], 'losses': score[1], 'draws': score[2]},
+                          elo0, SPRT_ALPHA, elo1, SPRT_BETA, SPRT_DRAWELO)
+
+
+def format_elo(score):
+    """Formats the Elo estimate, or nothing while it is not defined yet."""
+    try:
+        elo, elo95, los = stat_util.get_elo(score)
+    except (ValueError, ZeroDivisionError):
+        # Undefined until the score has enough spread, e.g. before the first loss
+        return ''
+    if elo95 <= 0:
+        # One of the bounds ran past a score of 0 or 1, where Elo is not
+        # defined, so there is no interval to report around the estimate yet.
+        return ' ELO: {:.2f} (95% interval undefined) LOS: {:.1f}%'.format(elo, 100 * los)
+    return ' ELO: {:.2f} +-{:.1f} (95%) LOS: {:.1f}%'.format(elo, elo95, 100 * los)
+
+
+def format_sprt(score, elo0, elo1):
+    result = sprt(score, elo0, elo1)
+    return ' LLR: {:.2f} ({:.2f},{:.2f}) [{:.2f},{:.2f}]'.format(
+        result['llr'], result['lower_bound'], result['upper_bound'], elo0, elo1)
+
+
 class Scoreboard:
     """The W/L/D counters and the stop condition shared by all concurrent matches.
 
@@ -482,8 +540,10 @@ class Scoreboard:
     running several of them concurrently never overshoots the requested number.
     """
 
-    def __init__(self, games):
+    def __init__(self, games, elos=None):
+        """Plays up to games games, or until an SPRT on the (elo0, elo1) elos finishes."""
         self.games = games
+        self.elos = elos
         self.score = [0, 0, 0]
         self.reserved = 0
         self.stopped = False
@@ -492,7 +552,9 @@ class Scoreboard:
     def reserve(self, count):
         """Claims up to count games and returns how many were granted."""
         with self.lock:
-            granted = 0 if self.stopped else max(min(count, self.games - self.reserved), 0)
+            if self.stopped or (self.elos and sprt(self.score, *self.elos)['finished']):
+                return 0
+            granted = max(min(count, self.games - self.reserved), 0)
             self.reserved += granted
             return granted
 
@@ -505,7 +567,21 @@ class Scoreboard:
         with self.lock:
             self.score[result - 1] += 1
             score = list(self.score)
-        logging.info('Total: {} W: {} L: {} D: {}'.format(sum(score), *score))
+        logging.info('Total: {} W: {} L: {} D: {}{}{}'.format(
+            sum(score), score[0], score[1], score[2], format_elo(score),
+            format_sprt(score, *self.elos) if self.elos else ''))
+
+    def report(self):
+        """Logs the final result, and how an SPRT test ended."""
+        with self.lock:
+            score = list(self.score)
+        logging.info('Finished after {} games. W: {} L: {} D: {}{}'.format(
+            sum(score), score[0], score[1], score[2], format_elo(score)))
+        if self.elos:
+            state = sprt(score, *self.elos)['state']
+            logging.info('SPRT [{:.2f},{:.2f}]: {}'.format(
+                self.elos[0], self.elos[1],
+                {'accepted': 'H1 accepted', 'rejected': 'H0 accepted'}.get(state, 'inconclusive')))
 
     def stop(self):
         """Keeps the matches from starting further games."""
@@ -565,13 +641,17 @@ class Match:
         self.close()
         return False
 
-    def play_game(self, flip, start_fens):
-        """Plays one game and returns its result from engine 1's point of view."""
+    def play_game(self, flip, start_fen):
+        """Plays one game and returns its result from engine 1's point of view.
+
+        Both boards of a two-board variant start from the same position, the
+        way a real bughouse game does.
+        """
         game = Game(self.engines[flip], self.engines[not flip], self.time_control,
-                    self.variant, start_fens[0])
+                    self.variant, start_fen)
         if self.two_boards:
             game2 = Game(self.board2_engines[not flip], self.board2_engines[flip], self.time_control,
-                         self.variant, start_fens[1])
+                         self.variant, start_fen)
             game.partner = game2
             game2.partner = game
             self.engines[0].partner = self.board2_engines[0]
@@ -616,22 +696,55 @@ class Match:
     def run(self):
         """Plays games until the scoreboard is exhausted.
 
-        Games are played in pairs from the same start positions with the colors
+        Games are played in pairs from the same start position with the colors
         swapped, so that neither engine benefits from a lopsided opening.
         """
         while True:
             games = self.scoreboard.reserve(2)
             if not games:
                 break
-            start_fens = [random.choice(self.start_fens) for _ in range(2 if self.two_boards else 1)]
+            start_fen = random.choice(self.start_fens)
             for flip in range(games):
                 try:
                     self.restart_dead_engines()
-                    result = self.play_game(flip, start_fens)
+                    result = self.play_game(flip, start_fen)
                 except BaseException:
                     self.scoreboard.release(games - flip)
                     raise
                 self.scoreboard.record(result)
+
+
+def book_path(book, variant):
+    """Resolves --book to a path.
+
+    Given without one, it means the variant's book in a books directory next to
+    the script, which is where variantfishtest keeps its collection.
+    """
+    if book is True:
+        return os.path.join(os.path.dirname(os.path.realpath(__file__)), 'books', variant + '.epd')
+    return book
+
+
+def load_book(book, variant):
+    """Reads the start positions of an EPD opening book."""
+    book = book_path(book, variant)
+    two_boards = sf.two_boards(variant)
+    fens = []
+    with open(book) as epd:
+        for number, line in enumerate(epd, start=1):
+            fen = line.strip().rstrip(';')
+            if not fen:
+                continue
+            # A two-board variant needs the holdings in the position, since the
+            # partner board keeps appending the pieces it passes on to them.
+            if sf.validate_fen(fen, variant) != sf.FEN_OK or (two_boards and ']' not in fen):
+                logging.warning('Skipping invalid position in {} line {}: {}'.format(book, number, fen))
+                continue
+            fens.append(fen)
+    if not fens:
+        raise ValueError('No valid positions in {}'.format(book))
+    logging.info('Book {}: {} positions'.format(book, len(fens)))
+    return fens
 
 
 def warn_if_oversubscribed(variant, concurrency):
@@ -661,17 +774,19 @@ def run_match(match, errors):
         match.scoreboard.stop()
 
 
-def main(engine1, engine2, e1_options, e2_options, time_control, variant, num_games, concurrency, **kwargs):
+def main(engine1, engine2, e1_options, e2_options, time_control, variant, num_games, concurrency,
+         book, sprt, elo0, elo1, **kwargs):
     time_control.warn_if_inexact()
     warn_if_oversubscribed(variant, concurrency)
-    scoreboard = Scoreboard(num_games)
+    start_fens = load_book(book, variant) if book else None
+    scoreboard = Scoreboard(num_games, (elo0, elo1) if sprt else None)
     errors = []
     with contextlib.ExitStack() as stack:
         threads = []
         for i in range(concurrency):
             name = 'match{}'.format(i + 1)
             match = stack.enter_context(Match(engine1, engine2, dict(e1_options), dict(e2_options),
-                                              time_control, variant, scoreboard, name=name))
+                                              time_control, variant, scoreboard, start_fens, name))
             threads.append(threading.Thread(target=run_match, args=(match, errors), name=name, daemon=True))
         for thread in threads:
             thread.start()
@@ -683,6 +798,7 @@ def main(engine1, engine2, e1_options, e2_options, time_control, variant, num_ga
             scoreboard.stop()
             for thread in threads:
                 thread.join()
+    scoreboard.report()
     if errors:
         raise errors[0]
 
@@ -698,6 +814,11 @@ if __name__ == '__main__':
     parser.add_argument('-v', '--variant', default='chess', help='variant name')
     parser.add_argument('-n', '--num-games', type=int, default=1000, help='maximum number of games')
     parser.add_argument('-c', '--concurrency', type=int, default=1, help='number of games to play concurrently')
+    parser.add_argument('-b', '--book', nargs='?', const=True,
+                        help='EPD opening book, or the variant book in books/ if given without a path')
+    parser.add_argument('-s', '--sprt', action='store_true', help='stop as soon as an SPRT test concludes')
+    parser.add_argument('--elo0', type=float, default=0, help='null hypothesis of the SPRT test')
+    parser.add_argument('--elo1', type=float, default=10, help='alternative hypothesis of the SPRT test')
     parser.add_argument('-l', '--log-level', default='INFO', help='logging level')
     parser.add_argument('--strict-xboard', action='store_true',
                         help='announce only whole-second increments, as the xboard protocol defines them')
@@ -716,6 +837,10 @@ if __name__ == '__main__':
                      'time limit: {}'.format(TimeControl.MIN_BASE_TIME, args.time_control))
     if args.concurrency < 1:
         parser.error('Invalid concurrency: {}'.format(args.concurrency))
+    if args.sprt and args.elo0 >= args.elo1:
+        parser.error('elo0 must be below elo1: {} >= {}'.format(args.elo0, args.elo1))
+    if args.book and not os.path.exists(book_path(args.book, args.variant)):
+        parser.error('Opening book not found: {}'.format(book_path(args.book, args.variant)))
     # Tell the games apart once more than one of them writes to the log
     log_format = '%(threadName)s: %(message)s' if args.concurrency > 1 else '%(message)s'
     logging.basicConfig(level=numeric_level, format=log_format)

@@ -3,6 +3,7 @@ import sys
 import unittest
 
 import fairyfishtest
+import stat_util
 
 
 # A stand-in engine that stays alive until it is told to quit, without ever
@@ -205,6 +206,50 @@ class TestScoreboard(unittest.TestCase):
         for result in (1, 1, -1, 0):
             scoreboard.record(result)
         self.assertEqual(scoreboard.score, [2, 1, 1])
+
+
+class TestStatistics(unittest.TestCase):
+    def test_elo(self):
+        elo, elo95, los = stat_util.get_elo([63, 34, 3])
+        self.assertAlmostEqual(elo, 103.73, places=2)
+        self.assertAlmostEqual(elo95, 71.10, places=2)
+        self.assertAlmostEqual(los, 0.9990, places=4)
+
+        # a balanced score is no difference at all, with an even chance either way
+        elo, _, los = stat_util.get_elo([50, 50, 0])
+        self.assertAlmostEqual(elo, 0, places=6)
+        self.assertAlmostEqual(los, 0.5, places=6)
+
+    def test_elo_undefined(self):
+        # the bounds run out of the defined range before the score has spread
+        self.assertEqual(fairyfishtest.format_elo([2, 1, 1]), '')
+        # one bound past the defined range leaves an estimate but no interval
+        self.assertIn('95% interval undefined', fairyfishtest.format_elo([0, 2, 1]))
+        self.assertIn('+-71.1 (95%)', fairyfishtest.format_elo([63, 34, 3]))
+
+    def test_sprt(self):
+        # not enough of a spread to estimate drawelo yet
+        self.assertEqual(fairyfishtest.sprt([10, 0, 20], 0, 5)['llr'], 0.0)
+
+        undecided = fairyfishtest.sprt([716, 591, 2163], 0, 5)
+        self.assertAlmostEqual(undecided['llr'], 2.5669, places=4)
+        self.assertFalse(undecided['finished'])
+
+        self.assertEqual(fairyfishtest.sprt([600, 400, 1000], 0, 5)['state'], 'accepted')
+        self.assertEqual(fairyfishtest.sprt([400, 600, 1000], 0, 5)['state'], 'rejected')
+
+    def test_scoreboard_stops_on_sprt(self):
+        scoreboard = fairyfishtest.Scoreboard(10000, (0, 5))
+        # A clearly stronger engine 1, so the test accepts H1 well before the
+        # game limit. The results have to cover wins, losses and draws alike,
+        # since the test cannot estimate drawelo out of a sample without them.
+        results = [1, 1, 0, -1]
+        played = 0
+        while scoreboard.reserve(1):
+            scoreboard.record(results[played % len(results)])
+            played += 1
+        self.assertLess(played, 10000)
+        self.assertEqual(fairyfishtest.sprt(scoreboard.score, 0, 5)['state'], 'accepted')
 
 
 if __name__ == '__main__':

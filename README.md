@@ -24,6 +24,36 @@ python fairyfishtest.py stockfish-test stockfish-base -v bughouse -n 100 -t 10+0
 ```
 Note that a two-board variant like bughouse already runs four engines per game, so the number of engine processes is `4 * concurrency`. Since the clocks are kept in wall clock time and a late reply is counted as a loss on time, running more engines than the machine has cores does not just add noise to the result, it decides games. The script warns when the requested concurrency oversubscribes the CPUs.
 
+### Opening books
+`-b/--book` reads start positions from an EPD file, one position per line, and picks one at random for each pair of games. Positions that the variant does not accept are skipped with a warning. Given without a path, `-b` looks for `books/<variant>.epd` next to the script, which is where [variantfishtest](https://github.com/ianfab/variantfishtest) keeps its collection.
+
+```
+python fairyfishtest.py stockfish-test stockfish-base -v bughouse -n 100 -t 10+0 -b books/bughouse.epd
+```
+
+Both boards of a two-board variant start from the same position, the way a real bughouse game does. A book for such a variant has to include the holdings in its positions, since the partner board keeps appending the pieces it passes on to them.
+
+### SPRT and Elo
+Every result line carries the Elo estimate, its 95% error bar and the [likelihood of superiority](https://www.chessprogramming.org/Match_Statistics#Likelihood_of_superiority) of the first engine:
+
+```
+Total: 100 W: 63 L: 34 D: 3 ELO: 103.73 +-71.1 (95%) LOS: 99.9%
+```
+
+`-s/--sprt` stops the run as soon as a [sequential probability ratio test](https://en.wikipedia.org/wiki/Sequential_probability_ratio_test) can decide between the two hypotheses, rather than playing all `-n` games. `--elo0` is the null hypothesis and `--elo1` the alternative, defaulting to 0 and 10:
+
+```
+python fairyfishtest.py stockfish-test stockfish-base -v bughouse -n 5000 -t 10+0 -b books/bughouse.epd -s --elo0 0 --elo1 5
+```
+
+The result lines then also carry the log-likelihood ratio and the bounds it is tested against, and the run reports which hypothesis it settled on:
+
+```
+Total: 317 W: 152 L: 70 D: 95 ELO: 91.96 +-32.7 (95%) LOS: 100.0% LLR: 2.96 (-2.94,2.94) [0.00,10.00]
+Finished after 317 games. W: 152 L: 70 D: 95 ELO: 91.96 +-32.7 (95%) LOS: 100.0%
+SPRT [0.00,10.00]: H1 accepted
+```
+
 ### Time controls
 The clocks are kept and enforced by the script itself, and announced to the engines in centiseconds through the xboard `time` and `otim` commands before every move. The base time therefore reaches the engines exactly, whatever the `level` command rounded it to.
 
