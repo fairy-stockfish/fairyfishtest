@@ -20,12 +20,18 @@ import argparse
 from collections import Counter
 import logging
 import math
+import queue
 import random
 import subprocess
 import threading
 import time
 
 import pyffish as sf
+
+
+# Grace period on top of the remaining clock before an unresponsive engine is
+# counted as having lost on time.
+MOVE_TIMEOUT_GRACE = 10
 
 
 class Engine:
@@ -35,6 +41,13 @@ class Engine:
         self.partner = None
         self.rank_conversion = False  # convert ranks from zero-based to one-based
         self.options = options
+        # The engine's output is drained by a dedicated thread, so that partner
+        # tells are relayed as soon as they appear rather than only while we
+        # happen to be waiting for this engine's move, and so that the pipe
+        # never fills up while the engine is idle.
+        self.replies = queue.Queue()
+        self.reader = threading.Thread(target=self._read_loop, daemon=True)
+        self.reader.start()
 
     def initialize(self):
         with self.lock:
@@ -45,8 +58,18 @@ class Engine:
             self.process.stdin.flush()
 
     def newgame(self, variant, time_control):
+        # Drop anything the engine may still have said about the previous game,
+        # e.g. a move it finished after the game had already been decided.
+        while True:
+            try:
+                stale = self.replies.get_nowait()
+            except queue.Empty:
+                break
+            logging.debug('Discarding stale reply: {}'.format(stale))
         with self.lock:
             self.rank_conversion = sf.start_fen(variant).count('/') + 1 == 10
+            # Make sure the engine is not still searching when 'new' arrives
+            self.process.stdin.write('force\n')
             self.process.stdin.write('new\n')
             self.process.stdin.write('variant {}\n'.format(variant))
             if self.partner:
@@ -66,15 +89,69 @@ class Engine:
             self.process.stdin.write('go\n')
             self.process.stdin.flush()
 
-    def get_move(self):
-        while True:
-            line = self.process.stdout.readline()
-            if self.partner and line.startswith('tellics ptell'):
-                self.partner.ptell(line.strip().split(None, 2)[2])
-            if line.startswith('move'):
-                return self.move_to_uci(line.strip().split()[1], self.rank_conversion)
-            if line.startswith(('1-0', '0-1', '1/2-1/2')):
-                return None
+    def _read_loop(self):
+        """Drains the engine's output and relays partner tells immediately.
+
+        Runs for the lifetime of the engine. Moves and claimed results are
+        handed to get_move() through a queue, everything else is logged.
+        """
+        try:
+            for line in self.process.stdout:
+                partner = self.partner
+                if partner and line.startswith('tellics ptell'):
+                    fields = line.strip().split(None, 2)
+                    if len(fields) > 2:
+                        partner.ptell(fields[2])
+                elif line.startswith('move'):
+                    fields = line.strip().split()
+                    if len(fields) > 1:
+                        self.replies.put(('move', fields[1]))
+                    else:
+                        logging.error('Engine sent a move without a move: {}'.format(line.strip()))
+                elif line.startswith(('1-0', '0-1', '1/2-1/2')):
+                    self.replies.put(('result', line.strip().split()[0]))
+                elif line.startswith('resign'):
+                    self.replies.put(('resign', None))
+                elif line.startswith(('Illegal move', 'Error')):
+                    logging.error('Engine rejected a command: {}'.format(line.strip()))
+        except (OSError, ValueError):
+            pass  # pipe closed while we were reading
+        finally:
+            self.replies.put(('eof', None))
+
+    def get_move(self, timeout=None):
+        """Returns (kind, value) where kind is move, result, resign, eof or timeout."""
+        try:
+            kind, value = self.replies.get(timeout=timeout)
+        except queue.Empty:
+            return 'timeout', None
+        if kind == 'eof':
+            # Keep reporting EOF rather than blocking forever on a dead engine
+            self.replies.put(('eof', None))
+        elif kind == 'move':
+            return kind, self.move_to_uci(value, self.rank_conversion)
+        return kind, value
+
+    def close(self):
+        try:
+            if self.process.poll() is None:
+                with self.lock:
+                    self.process.stdin.write('quit\n')
+                    self.process.stdin.flush()
+        except (OSError, ValueError):
+            pass
+        for stop in (self.process.terminate, self.process.kill):
+            try:
+                self.process.wait(timeout=5)
+                break
+            except subprocess.TimeoutExpired:
+                stop()
+        for stream in (self.process.stdin, self.process.stdout):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+        self.reader.join(timeout=5)
 
     @staticmethod
     def move_to_uci(move, rank_conversion):
@@ -132,6 +209,16 @@ class TimeControl:
         moves = int(moves_and_time[0]) if len(moves_and_time) > 1 else 0
         return TimeControl(time, increment, moves)
 
+    def warn_if_inexact(self):
+        # The xboard level command only takes whole seconds, and Fairy-Stockfish
+        # parses the increment as an integer, so a fractional time control can
+        # not be announced to the engine even though we keep the clocks with it.
+        if self.time != int(self.time) or self.increment != int(self.increment):
+            logging.warning('Time control {} cannot be expressed in the xboard level command, '
+                            'announcing {}/{}+{} instead. The engine will budget its time for the '
+                            'announced control while the clocks are kept for the requested one.'
+                            .format(self, self.moves, int(self.time), int(self.increment)))
+
     def format_xboard(self):
         return '{} {}:{} {}'.format(self.moves, int(self.time // 60), int(self.time % 60), int(self.increment))
 
@@ -154,7 +241,6 @@ class Game:
 
     def initialize(self):
         for engine in self.engines:
-            engine.initialize()
             engine.newgame(self.variant, self.time_control)
 
     def is_legal(self):
@@ -164,7 +250,7 @@ class Game:
     def is_game_end(self):
         with self.lock:
             game_end = False
-            if self.clock_times[(len(self.moves) - 1) % 2] <= 0:
+            if self.moves and self.clock_times[(len(self.moves) - 1) % 2] <= 0:
                 # time loss
                 logging.warning('Engine {} loses on time.'.format((len(self.moves) - 1) % 2 + 1))
                 result = 1
@@ -185,33 +271,75 @@ class Game:
 
     def play(self):
         self.initialize()
-        while not self.is_game_end() and not (self.partner and self.partner.is_game_end()):
-            idx = len(self.moves) % 2
-            engine = self.engines[idx]
-            engine.update_clocks(self.clock_times[idx], self.clock_times[idx - 1])
-            engine.usermove(self.moves[-1]) if self.moves else engine.go()
-            start_time = time.time()
+        # The partner board sets its own result, we only have to notice it. Do
+        # not evaluate the partner's position from this thread: that used to
+        # race with the partner appending its move.
+        while not self.is_game_end() and not (self.partner and self.partner.result is not None):
             with self.lock:
-                self.moves.append(engine.get_move())
-            # woraround for e1e1-style passing moves
-            if self.moves[-1] == '0000':
-                moves = sf.legal_moves(self.variant, self.get_start_fen(), self.moves[:-1])
-                pass_candidates = [move for move in moves if Engine.move_from_uci(move, False) == '@@@@']
-                if len(pass_candidates) == 1:
-                    self.moves[-1] = pass_candidates[0]
+                idx = len(self.moves) % 2
+                last_move = self.moves[-1] if self.moves else None
+                clock, opp_clock = self.clock_times[idx], self.clock_times[idx - 1]
+            engine = self.engines[idx]
+            engine.update_clocks(clock, opp_clock)
+            engine.usermove(last_move) if last_move else engine.go()
+            start_time = time.time()
+            # Never wait for an engine forever, otherwise a hung engine freezes
+            # the whole match and the time loss below can never be detected.
+            kind, move = engine.get_move(timeout=max(clock, 0) + MOVE_TIMEOUT_GRACE)
             end_time = time.time()
-            self.clock_times[idx] += self.time_control.increment - (end_time - start_time)
-            logging.debug('Position: {}, Move: {}'.format(sf.get_fen(self.variant, self.get_start_fen(), self.moves[:-1]),
-                                                          self.moves[-1]))
-            if self.partner and self.is_legal():
-                captured = self.get_captured()
+            if kind != 'move':
+                self.abandon(kind, move, idx)
+                return
+            # Resolve the move before appending it, so that the partner thread
+            # never sees the raw 0000 placeholder and reports it as illegal.
+            if move == '0000':
+                with self.lock:
+                    start_fen, previous_moves = self.get_start_fen(), list(self.moves)
+                moves = sf.legal_moves(self.variant, start_fen, previous_moves)
+                pass_candidates = [m for m in moves if Engine.move_from_uci(m, False) == '@@@@']
+                if len(pass_candidates) == 1:
+                    move = pass_candidates[0]
+            # Append the move and charge the clock in one step, so that the
+            # partner thread never sees one without the other. The start FEN is
+            # taken from the same snapshot, since the partner keeps appending to
+            # our holdings and the two have to match.
+            with self.lock:
+                self.moves.append(move)
+                self.clock_times[idx] += self.time_control.increment - (end_time - start_time)
+                start_fen, current_moves = self.get_start_fen(), list(self.moves)
+            logging.debug('Position: {}, Move: {}'.format(sf.get_fen(self.variant, start_fen, current_moves[:-1]), move))
+            if self.partner and move in sf.legal_moves(self.variant, start_fen, current_moves[:-1]):
+                captured = self.get_captured(start_fen, current_moves)
                 if captured:
                     self.partner.set_holdings(captured)
 
-    def get_captured(self):
+    def abandon(self, kind, claim, idx):
+        """Ends the game when the engine to move did not deliver a move."""
+        if kind == 'result':
+            logging.warning('Engine {} claims the result {}.'.format(idx + 1, claim))
+            if claim == '1/2-1/2':
+                result = 0
+            else:
+                # engines[0] moves first, so it has the side to move of the start position
+                first_is_white = self.get_start_fen().split()[1] == 'w'
+                result = 1 if (claim == '1-0') == first_is_white else -1
+            with self.lock:
+                self.result = result
+            return
+        if kind == 'timeout':
+            logging.warning('Engine {} did not move in time.'.format(idx + 1))
+        elif kind == 'eof':
+            logging.error('Engine {} died.'.format(idx + 1))
+        elif kind == 'resign':
+            logging.info('Engine {} resigns.'.format(idx + 1))
+        # The engine to move loses. Game.result is from engines[0]'s point of view.
+        with self.lock:
+            self.result = -1 if idx == 0 else 1
+
+    def get_captured(self, start_fen, moves):
         # TODO: this does not consider promoted pieces
-        previous_fen = sf.get_fen(self.variant, self.get_start_fen(), self.moves[:-1])
-        current_fen = sf.get_fen(self.variant, self.get_start_fen(), self.moves)
+        previous_fen = sf.get_fen(self.variant, start_fen, moves[:-1])
+        current_fen = sf.get_fen(self.variant, start_fen, moves)
         piece_filter = str.isupper if current_fen.split()[1] == 'w' else str.islower
         previous_pieces = Counter(filter(piece_filter, previous_fen.split()[0]))
         current_pieces = Counter(filter(piece_filter, current_fen.split()[0]))
@@ -254,6 +382,22 @@ class Match:
         self.games = games
         self.start_fens = start_fens if start_fens else [sf.start_fen(variant)]
         self.score = [0, 0, 0]
+        for engine in self.all_engines():
+            engine.initialize()
+
+    def all_engines(self):
+        return self.engines + (self.board2_engines or [])
+
+    def close(self):
+        for engine in self.all_engines():
+            engine.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
 
     def play_game(self):
         flip = sum(self.score) % 2
@@ -268,11 +412,25 @@ class Match:
             self.engines[1].partner = self.board2_engines[1]
             self.board2_engines[0].partner = self.engines[0]
             self.board2_engines[1].partner = self.engines[1]
-            thread2 = threading.Thread(target=game2.play, daemon=True)
+            board2_error = []
+
+            def play_board2():
+                try:
+                    game2.play()
+                except Exception as e:  # noqa: BLE001 - reported in the main thread below
+                    logging.exception('Board 2 failed')
+                    board2_error.append(e)
+
+            thread2 = threading.Thread(target=play_board2, daemon=True)
             thread2.start()
         game.play()
         if self.two_boards:
-            thread2.join()
+            # Board 2 can only be as late as one search plus the timeout grace
+            thread2.join(timeout=self.time_control.time + 2 * MOVE_TIMEOUT_GRACE)
+            if thread2.is_alive():
+                raise RuntimeError('Board 2 did not finish')
+            if board2_error:
+                raise board2_error[0]
             logging.debug('Board1: {}, Board2: {}'.format(game.result, game2.result))
             assert game.result in (1, 0, -1) or game2.result in (1, 0, -1)
             result = (game.result or 0) - (game2.result or 0)
@@ -292,8 +450,9 @@ class Match:
 
 
 def main(engine1, engine2, e1_options, e2_options, time_control, variant, num_games, **kwargs):
-    match = Match(engine1, engine2, dict(e1_options), dict(e2_options), time_control, variant, num_games)
-    match.run()
+    time_control.warn_if_inexact()
+    with Match(engine1, engine2, dict(e1_options), dict(e2_options), time_control, variant, num_games) as match:
+        match.run()
 
 
 if __name__ == '__main__':
