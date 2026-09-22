@@ -199,32 +199,66 @@ class Engine:
 
 
 class TimeControl:
-    def __init__(self, time, increment=0, moves=0):
+    # A base time below a second is announced as "0:0", which leaves the engine
+    # without a time limit: Fairy-Stockfish discards the time and otim updates
+    # unless the level command announced a non-zero base time, and then never
+    # returns a move.
+    MIN_BASE_TIME = 1
+
+    def __init__(self, time, increment=0, moves=0, strict=False):
         self.time = time
         self.increment = increment
         self.moves = moves
+        self.strict = strict
 
     @staticmethod
-    def parse(stringified_tc):
+    def parse(stringified_tc, strict=False):
         time_and_increment = stringified_tc.split('+')
         moves_and_time = time_and_increment[0].split('/')
         time = float(moves_and_time[-1])
         increment = float(time_and_increment[1]) if len(time_and_increment) > 1 else 0
         moves = int(moves_and_time[0]) if len(moves_and_time) > 1 else 0
-        return TimeControl(time, increment, moves)
+        return TimeControl(time, increment, moves, strict)
 
     def warn_if_inexact(self):
-        # The xboard level command only takes whole seconds, and Fairy-Stockfish
-        # parses the increment as an integer, so a fractional time control can
-        # not be announced to the engine even though we keep the clocks with it.
-        if self.time != int(self.time) or self.increment != int(self.increment):
-            logging.warning('Time control {} cannot be expressed in the xboard level command, '
-                            'announcing {}/{}+{} instead. The engine will budget its time for the '
-                            'announced control while the clocks are kept for the requested one.'
-                            .format(self, self.moves, int(self.time), int(self.increment)))
+        """Warns about the part of the time control the level command cannot convey.
+
+        The base time needs no warning, however odd it looks in the level
+        command: time and otim carry the clock in centiseconds before every
+        move and override whatever level announced. The increment has no such
+        channel, and the protocol only defines it in whole seconds.
+        """
+        if self.increment == int(self.increment):
+            return
+        if self.strict:
+            logging.warning('Increment {} is not a whole number of seconds, and --strict-xboard is set, '
+                            'so it is announced as {} instead. The engine budgets its time for the '
+                            'announced increment while the clocks are kept for the requested one.'
+                            .format(self.increment, int(self.increment)))
+        else:
+            logging.warning('Increment {} is not a whole number of seconds, which the xboard level '
+                            'command does not define. It is announced as such anyway, which needs an '
+                            'engine that reads the increment as a real number, such as Fairy-Stockfish. '
+                            'Other engines read an increment of {} instead; pass --strict-xboard to '
+                            'announce that to every engine.'
+                            .format(self.increment, int(self.increment)))
+
+    def format_increment(self):
+        """Formats the increment for the level command.
+
+        The protocol defines whole seconds, which --strict-xboard sticks to.
+        Otherwise a fractional increment is announced at the millisecond
+        resolution the engines keep their clocks in, with whole numbers still
+        formatted as whole numbers so that a conventional time control is
+        announced exactly as before.
+        """
+        if self.strict:
+            return str(int(self.increment))
+        return '{:.3f}'.format(self.increment).rstrip('0').rstrip('.')
 
     def format_xboard(self):
-        return '{} {}:{} {}'.format(self.moves, int(self.time // 60), int(self.time % 60), int(self.increment))
+        return '{} {}:{} {}'.format(self.moves, int(self.time // 60), int(self.time % 60),
+                                    self.format_increment())
 
     def __str__(self):
         return ('{}/'.format(self.moves) if self.moves else '') + '{}+{}'.format(self.time, self.increment)
@@ -592,16 +626,21 @@ if __name__ == '__main__':
     parser.add_argument('-n', '--num-games', type=int, default=1000, help='maximum number of games')
     parser.add_argument('-c', '--concurrency', type=int, default=1, help='number of games to play concurrently')
     parser.add_argument('-l', '--log-level', default='INFO', help='logging level')
+    parser.add_argument('--strict-xboard', action='store_true',
+                        help='announce only whole-second increments, as the xboard protocol defines them')
     args = parser.parse_args()
     numeric_level = getattr(logging, args.log_level.upper(), None)
     if not isinstance(numeric_level, int):
         parser.error('Invalid log level: {}'.format(args.log_level))
     try:
-        args.time_control = TimeControl.parse(args.time_control)
+        args.time_control = TimeControl.parse(args.time_control, args.strict_xboard)
     except Exception:
         parser.error('Invalid time control: {}'.format(args.time_control))
     if args.time_control.moves:  # TODO: support epochs
         parser.error('Time control not supported: {}'.format(args.time_control))
+    if args.time_control.time < TimeControl.MIN_BASE_TIME:
+        parser.error('Base time must be at least {} second, otherwise the engine is left without a '
+                     'time limit: {}'.format(TimeControl.MIN_BASE_TIME, args.time_control))
     if args.concurrency < 1:
         parser.error('Invalid concurrency: {}'.format(args.concurrency))
     # Tell the games apart once more than one of them writes to the log

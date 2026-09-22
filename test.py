@@ -29,6 +29,22 @@ class TestFairyFishTest(unittest.TestCase):
         tc = fairyfishtest.TimeControl.parse('10/20+3')
         self.assertEqual(tc.format_xboard(), '10 0:20 3')
 
+        # a whole-second increment is announced exactly as before
+        self.assertEqual(fairyfishtest.TimeControl.parse('60+2').format_xboard(), '0 1:0 2')
+        self.assertEqual(fairyfishtest.TimeControl.parse('10+0').format_xboard(), '0 0:10 0')
+
+        # a fractional increment needs an engine that reads it as a real number
+        self.assertEqual(fairyfishtest.TimeControl.parse('10+0.1').format_xboard(), '0 0:10 0.1')
+        self.assertEqual(fairyfishtest.TimeControl.parse('60+2.5').format_xboard(), '0 1:0 2.5')
+
+        # --strict-xboard sticks to the whole seconds the protocol defines
+        self.assertEqual(fairyfishtest.TimeControl.parse('10+0.1', True).format_xboard(), '0 0:10 0')
+        self.assertEqual(fairyfishtest.TimeControl.parse('60+2.5', True).format_xboard(), '0 1:0 2')
+
+        # a fractional base time is announced rounded down, since time and otim
+        # override it with centisecond precision before every move anyway
+        self.assertEqual(fairyfishtest.TimeControl.parse('10.5+1').format_xboard(), '0 0:10 1')
+
     def test_to_uci(self):
         self.assertEqual(fairyfishtest.Engine.move_to_uci('a1a2', False), 'a1a2')
         self.assertEqual(fairyfishtest.Engine.move_to_uci('h8h9+', True), 'h9h10+')
