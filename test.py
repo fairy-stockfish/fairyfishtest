@@ -47,5 +47,20 @@ class TestFairyFishTest(unittest.TestCase):
         self.assertEqual(fairyfishtest.Engine.move_from_uci('e1e1', True), '@@@@')
 
 
+class TestBughouse(unittest.TestCase):
+    def get_captured(self, start_fen, moves):
+        game = fairyfishtest.Game.__new__(fairyfishtest.Game)
+        game.variant = 'bughouse'
+        return game.get_captured(start_fen, moves)
+
+    def test_get_captured(self):
+        self.assertEqual(self.get_captured('r2qk3/8/8/8/8/8/8/3RK3[] w - - 0 1', ['d1d8', 'e8d8']), 'R')
+        # a promoted piece is passed on as a pawn
+        self.assertEqual(self.get_captured('r3k3/1P6/8/8/8/8/8/4K2R[] w - - 0 1', ['b7b8q', 'a8b8']), 'P')
+        self.assertEqual(self.get_captured('4k2r/8/8/8/8/8/1p6/R3K3[] b - - 0 1', ['b2b1q', 'a1b1']), 'p')
+        # promoting does not pass on anything
+        self.assertEqual(self.get_captured('4k3/1P6/8/8/8/8/8/4K2R[] w - - 0 1', ['b7b8q']), '')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

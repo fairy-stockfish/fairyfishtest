@@ -338,13 +338,25 @@ class Game:
             self.result = -1 if idx == 0 else 1
 
     def get_captured(self, start_fen, moves):
-        # TODO: this does not consider promoted pieces
         previous_fen = sf.get_fen(self.variant, start_fen, moves[:-1])
         current_fen = sf.get_fen(self.variant, start_fen, moves)
         piece_filter = str.isupper if current_fen.split()[1] == 'w' else str.islower
-        previous_pieces = Counter(filter(piece_filter, previous_fen.split()[0]))
-        current_pieces = Counter(filter(piece_filter, current_fen.split()[0]))
+        previous_pieces = self.count_pieces(previous_fen.split()[0], piece_filter)
+        current_pieces = self.count_pieces(current_fen.split()[0], piece_filter)
         return ''.join((previous_pieces - current_pieces).elements())
+
+    @staticmethod
+    def count_pieces(board, piece_filter):
+        """Counts the pieces of one side on the board, demoting promoted ones.
+
+        Promoted pieces are marked with a trailing '~' in the FEN. Capturing one
+        of them yields a pawn, so that is what has to be passed to the partner.
+        """
+        pieces = Counter()
+        for piece, suffix in zip(board, board[1:] + ' '):
+            if piece_filter(piece):
+                pieces[('P' if piece.isupper() else 'p') if suffix == '~' else piece] += 1
+        return pieces
 
     def get_start_fen(self):
         if self.partner:
