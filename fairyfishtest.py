@@ -35,30 +35,94 @@ import pyffish as sf
 # counted as having lost on time.
 MOVE_TIMEOUT_GRACE = 10
 
+# How often a match replaces the process of an engine that died before it gives
+# up, so that a reproducibly crashing engine does not restart forever.
+MAX_ENGINE_RESTARTS = 10
+
 
 class Engine:
     def __init__(self, args, options, name=None):
-        self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True)
+        self.args = args
+        self.name = name
         self.lock = threading.Lock()
         self.partner = None
         self.rank_conversion = False  # convert ranks from zero-based to one-based
         self.options = options
+        self._start()
+
+    def _start(self):
+        """Spawns the engine process and the thread draining its output."""
+        self.process = subprocess.Popen(self.args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        universal_newlines=True)
         # The engine's output is drained by a dedicated thread, so that partner
         # tells are relayed as soon as they appear rather than only while we
         # happen to be waiting for this engine's move, and so that the pipe
-        # never fills up while the engine is idle.
+        # never fills up while the engine is idle. A restart gets a fresh queue,
+        # so that the EOF of the previous process is not mistaken for this one's.
         self.replies = queue.Queue()
-        self.reader = threading.Thread(target=self._read_loop, daemon=True,
-                                       name='{}:reader'.format(name) if name else None)
+        self.eof = False
+        self.death_reported = False
+        self.reader = threading.Thread(target=self._read_loop, args=(self.process,), daemon=True,
+                                       name='{}:reader'.format(self.name) if self.name else None)
         self.reader.start()
 
-    def initialize(self):
+    def is_alive(self):
+        """Whether the engine still runs and still talks to us.
+
+        An engine that closed its output is of no use to us either, even if its
+        process happens to linger, so it counts as dead and gets restarted.
+        """
+        return self.process.poll() is None and not self.eof
+
+    def restart(self):
+        """Replaces a dead engine process by a freshly initialized one.
+
+        The Engine object itself is kept, so that the partner wiring of the
+        other boards keeps pointing at this engine.
+        """
+        logging.warning('Restarting engine {}.'.format(self.name))
+        self.close()
+        self._start()
+        self.initialize()
+
+    def _write(self, *lines):
+        """Sends commands to the engine. Returns False if it is not listening.
+
+        A dead engine is reported through the reply queue rather than by raising,
+        so that the game in progress ends like any other engine failure instead
+        of tearing down the whole run with a BrokenPipeError.
+        """
         with self.lock:
-            self.process.stdin.write('xboard\n')
-            self.process.stdin.write('protover 2\n')
-            for option, value in self.options.items():
-                self.process.stdin.write('option {}={}\n'.format(option, value))
-            self.process.stdin.flush()
+            returncode = self.process.poll()
+            if returncode is not None:
+                self._report_death('the process exited with {}'.format(returncode))
+                return False
+            if self.eof:
+                self._report_death('the process closed its output')
+                return False
+            try:
+                for line in lines:
+                    self.process.stdin.write(line + '\n')
+                self.process.stdin.flush()
+            except (OSError, ValueError) as e:
+                self._report_death(e)
+                return False
+            return True
+
+    def _report_death(self, reason):
+        # Only the first failure is worth an error, the rest of the game keeps
+        # talking to the same dead engine and would just flood the log.
+        message = 'Engine {} is not accepting commands: {}'.format(self.name, reason)
+        if self.death_reported:
+            logging.debug(message)
+        else:
+            logging.error(message)
+            self.death_reported = True
+        self.replies.put(('eof', None))
+
+    def initialize(self):
+        options = ['option {}={}'.format(option, value) for option, value in self.options.items()]
+        return self._write('xboard', 'protover 2', *options)
 
     def newgame(self, variant, time_control):
         # Drop anything the engine may still have said about the previous game,
@@ -69,37 +133,30 @@ class Engine:
             except queue.Empty:
                 break
             logging.debug('Discarding stale reply: {}'.format(stale))
-        with self.lock:
-            self.rank_conversion = sf.start_fen(variant).count('/') + 1 == 10
+        self.rank_conversion = sf.start_fen(variant).count('/') + 1 == 10
+        return self._write(
             # Make sure the engine is not still searching when 'new' arrives
-            self.process.stdin.write('force\n')
-            self.process.stdin.write('new\n')
-            self.process.stdin.write('variant {}\n'.format(variant))
-            if self.partner:
-                self.process.stdin.write('partner test\n')
-            self.process.stdin.write('level {}\n'.format(time_control.format_xboard()))
-            self.process.stdin.flush()
+            'force',
+            'new',
+            'variant {}'.format(variant),
+            *(['partner test'] if self.partner else []),
+            'level {}'.format(time_control.format_xboard()))
 
     def update_clocks(self, time, otim):
-        with self.lock:
-            # times in centiseconds
-            self.process.stdin.write('time {}\n'.format(int(time * 100)))
-            self.process.stdin.write('otim {}\n'.format(int(otim * 100)))
-            self.process.stdin.flush()
+        # times in centiseconds
+        return self._write('time {}'.format(int(time * 100)), 'otim {}'.format(int(otim * 100)))
 
     def go(self):
-        with self.lock:
-            self.process.stdin.write('go\n')
-            self.process.stdin.flush()
+        return self._write('go')
 
-    def _read_loop(self):
+    def _read_loop(self, process):
         """Drains the engine's output and relays partner tells immediately.
 
         Runs for the lifetime of the engine. Moves and claimed results are
         handed to get_move() through a queue, everything else is logged.
         """
         try:
-            for line in self.process.stdout:
+            for line in process.stdout:
                 partner = self.partner
                 if partner and line.startswith('tellics ptell'):
                     fields = line.strip().split(None, 2)
@@ -121,6 +178,8 @@ class Engine:
         except (OSError, ValueError):
             pass  # pipe closed while we were reading
         finally:
+            if self.process is process:  # not a leftover reader of a restarted engine
+                self.eof = True
             self.replies.put(('eof', None))
 
     def get_move(self, timeout=None):
@@ -183,19 +242,13 @@ class Engine:
             return move
 
     def ptell(self, message):
-        with self.lock:
-            self.process.stdin.write('ptell {}\n'.format(message))
-            self.process.stdin.flush()
+        return self._write('ptell {}'.format(message))
 
     def holding(self, holding):
-        with self.lock:
-            self.process.stdin.write('holding {}\n'.format(holding))
-            self.process.stdin.flush()
+        return self._write('holding {}'.format(holding))
 
     def usermove(self, move):
-        with self.lock:
-            self.process.stdin.write('usermove {}\n'.format(self.move_from_uci(move, self.rank_conversion)))
-            self.process.stdin.flush()
+        return self._write('usermove {}'.format(self.move_from_uci(move, self.rank_conversion)))
 
 
 class TimeControl:
@@ -462,7 +515,7 @@ class Scoreboard:
 
 class Match:
     def __init__(self, engine1, engine2, e1_options, e2_options, time_control, variant='chess',
-                 scoreboard=None, start_fens=None, name='match'):
+                 scoreboard=None, start_fens=None, name='match', max_restarts=MAX_ENGINE_RESTARTS):
         self.two_boards = sf.two_boards(variant)
         self.name = name
         # The names end up on the engines' reader threads, so that the log of a
@@ -476,11 +529,30 @@ class Match:
         self.variant = variant
         self.scoreboard = scoreboard if scoreboard is not None else Scoreboard(1)
         self.start_fens = start_fens if start_fens else [sf.start_fen(variant)]
+        self.max_restarts = max_restarts
+        self.restarts = 0
         for engine in self.all_engines():
             engine.initialize()
 
     def all_engines(self):
         return self.engines + (self.board2_engines or [])
+
+    def restart_dead_engines(self):
+        """Gives every engine that died a fresh process before the next game.
+
+        The Engine objects are reused, so the partner wiring that play_game sets
+        up survives a restart. Raises once the restart budget is exhausted, so
+        that an engine crashing in every game does not restart forever.
+        """
+        for engine in self.all_engines():
+            if engine.is_alive():
+                continue
+            if self.restarts >= self.max_restarts:
+                raise RuntimeError('Engine {} died and the limit of {} engine restarts is exhausted'
+                                   .format(engine.name, self.max_restarts))
+            self.restarts += 1
+            logging.warning('Engine restart {} of at most {}.'.format(self.restarts, self.max_restarts))
+            engine.restart()
 
     def close(self):
         for engine in self.all_engines():
@@ -554,6 +626,7 @@ class Match:
             start_fens = [random.choice(self.start_fens) for _ in range(2 if self.two_boards else 1)]
             for flip in range(games):
                 try:
+                    self.restart_dead_engines()
                     result = self.play_game(flip, start_fens)
                 except BaseException:
                     self.scoreboard.release(games - flip)

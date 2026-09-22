@@ -1,6 +1,18 @@
+import logging
+import sys
 import unittest
 
 import fairyfishtest
+
+
+# A stand-in engine that stays alive until it is told to quit, without ever
+# saying anything itself
+IDLE_ENGINE = [sys.executable, '-c', 'import sys\nfor line in sys.stdin:\n'
+               '    if line.strip() == "quit": break']
+# The same, but it closes its output right away, like an engine that stops
+# talking without dying
+MUTE_ENGINE = [sys.executable, '-c', 'import os, sys\nos.close(1)\nfor line in sys.stdin:\n'
+               '    if line.strip() == "quit": break']
 
 
 class TestFairyFishTest(unittest.TestCase):
@@ -76,6 +88,92 @@ class TestBughouse(unittest.TestCase):
         self.assertEqual(self.get_captured('4k2r/8/8/8/8/8/1p6/R3K3[] b - - 0 1', ['b2b1q', 'a1b1']), 'p')
         # promoting does not pass on anything
         self.assertEqual(self.get_captured('4k3/1P6/8/8/8/8/8/4K2R[] w - - 0 1', ['b7b8q']), '')
+
+
+class TestEngineRestart(unittest.TestCase):
+    """Covers what happens after an engine process died mid-run."""
+
+    def make_engine(self, name='e1', args=IDLE_ENGINE):
+        engine = fairyfishtest.Engine(args, {}, name)
+        self.addCleanup(engine.close)
+        return engine
+
+    @staticmethod
+    def kill(engine):
+        engine.process.kill()
+        engine.process.wait()
+
+    def test_write_to_dead_engine_reports_eof(self):
+        engine = self.make_engine()
+        self.kill(engine)
+        with self.assertLogs(level=logging.ERROR) as logs:
+            # None of the write paths may raise a BrokenPipeError
+            self.assertFalse(engine.go())
+            self.assertFalse(engine.update_clocks(10, 10))
+            self.assertFalse(engine.usermove('e2e4'))
+            self.assertFalse(engine.holding('[] []'))
+            self.assertFalse(engine.ptell('hi'))
+            self.assertFalse(engine.newgame('chess', fairyfishtest.TimeControl(10)))
+        # The game in progress sees the death like any other engine failure
+        self.assertEqual(engine.get_move(timeout=1), ('eof', None))
+        # and the log is not flooded with one error per command
+        self.assertEqual(len(logs.output), 1)
+
+    def test_restart_replaces_the_process(self):
+        engine = self.make_engine()
+        partner = self.make_engine('e2')
+        engine.partner = partner
+        old_process = engine.process
+        self.kill(engine)
+        self.assertFalse(engine.is_alive())
+        with self.assertLogs(level=logging.WARNING):
+            engine.restart()
+        self.assertTrue(engine.is_alive())
+        self.assertIsNot(engine.process, old_process)
+        # the partner wiring of the other boards points at the Engine object
+        self.assertIs(engine.partner, partner)
+        # the fresh process accepts commands again, and its queue is clean
+        self.assertTrue(engine.newgame('chess', fairyfishtest.TimeControl(10)))
+        self.assertEqual(engine.get_move(timeout=0.1), ('timeout', None))
+
+    def test_engine_that_closed_its_output_counts_as_dead(self):
+        engine = self.make_engine(args=MUTE_ENGINE)
+        self.assertEqual(engine.get_move(timeout=5), ('eof', None))
+        # An engine that stopped talking is of no use even while it still runs
+        self.assertIsNone(engine.process.poll())
+        self.assertFalse(engine.is_alive())
+        with self.assertLogs(level=logging.ERROR):
+            self.assertFalse(engine.go())
+
+    def make_match(self, engines, max_restarts):
+        match = fairyfishtest.Match.__new__(fairyfishtest.Match)
+        match.engines = engines
+        match.board2_engines = None
+        match.max_restarts = max_restarts
+        match.restarts = 0
+        return match
+
+    def test_match_restarts_dead_engines(self):
+        engines = [self.make_engine('e1'), self.make_engine('e2')]
+        match = self.make_match(engines, 2)
+        self.kill(engines[1])
+        with self.assertLogs(level=logging.WARNING):
+            match.restart_dead_engines()
+        self.assertEqual(match.restarts, 1)
+        self.assertTrue(all(engine.is_alive() for engine in engines))
+        # a run without deaths does not consume the budget
+        match.restart_dead_engines()
+        self.assertEqual(match.restarts, 1)
+
+    def test_match_gives_up_after_the_restart_limit(self):
+        engine = self.make_engine()
+        match = self.make_match([engine], 1)
+        self.kill(engine)
+        with self.assertLogs(level=logging.WARNING):
+            match.restart_dead_engines()
+        self.kill(engine)
+        with self.assertRaises(RuntimeError):
+            match.restart_dead_engines()
 
 
 class TestScoreboard(unittest.TestCase):
