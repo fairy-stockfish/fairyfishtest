@@ -101,6 +101,7 @@ class Engine:
                 if partner and line.startswith('tellics ptell'):
                     fields = line.strip().split(None, 2)
                     if len(fields) > 2:
+                        logging.debug('ptell relayed: {}'.format(fields[2]))
                         partner.ptell(fields[2])
                 elif line.startswith('move'):
                     fields = line.strip().split()
