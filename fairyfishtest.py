@@ -438,10 +438,14 @@ class Match:
             thread2.start()
         game.play()
         if self.two_boards:
-            # Board 2 can only be as late as one search plus the timeout grace
-            thread2.join(timeout=self.time_control.time + 2 * MOVE_TIMEOUT_GRACE)
+            # Board 2 can only be as late as one search plus the timeout grace.
+            # The bound has to come from its clocks rather than from the base
+            # time, since an increment lets them grow well beyond it.
+            with game2.lock:
+                timeout = max(max(game2.clock_times), 0) + 2 * MOVE_TIMEOUT_GRACE
+            thread2.join(timeout=timeout)
             if thread2.is_alive():
-                raise RuntimeError('Board 2 did not finish')
+                raise RuntimeError('Board 2 did not finish within {:.0f}s'.format(timeout))
             if board2_error:
                 raise board2_error[0]
             logging.debug('Board1: {}, Board2: {}'.format(game.result, game2.result))
