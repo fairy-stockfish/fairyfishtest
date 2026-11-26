@@ -542,8 +542,14 @@ def get_captured(variant, start_fen, moves):
     return ''.join((previous_pieces - current_pieces).elements())
 
 
-def sprt(score, elo0, elo1):
-    """Runs the sequential probability ratio test on a W/L/D score."""
+def sprt(score, elo0, elo1, pentanomial=None):
+    """Runs the sequential probability ratio test.
+
+    It is run on the game pairs if there are any in the pentanomial counts,
+    and on the W/L/D score of single games otherwise.
+    """
+    if pentanomial and sum(pentanomial):
+        return stat_util.SPRT_pentanomial(pentanomial, elo0, SPRT_ALPHA, elo1, SPRT_BETA)
     return stat_util.SPRT({'wins': score[0], 'losses': score[1], 'draws': score[2]},
                           elo0, SPRT_ALPHA, elo1, SPRT_BETA, SPRT_DRAWELO)
 
@@ -562,8 +568,8 @@ def format_elo(score):
     return ' ELO: {:.2f} +-{:.1f} (95%) LOS: {:.1f}%'.format(elo, elo95, 100 * los)
 
 
-def format_sprt(score, elo0, elo1):
-    result = sprt(score, elo0, elo1)
+def format_sprt(score, elo0, elo1, pentanomial=None):
+    result = sprt(score, elo0, elo1, pentanomial)
     return ' LLR: {:.2f} ({:.2f},{:.2f}) [{:.2f},{:.2f}]'.format(
         result['llr'], result['lower_bound'], result['upper_bound'], elo0, elo1)
 
@@ -692,7 +698,7 @@ class Scoreboard:
     def reserve(self, count):
         """Claims up to count games and returns how many were granted."""
         with self.lock:
-            if self.stopped or (self.elos and sprt(self.score, *self.elos)['finished']):
+            if self.stopped or (self.elos and sprt(self.score, *self.elos, self.pentanomial)['finished']):
                 return 0
             granted = max(min(count, self.games - self.reserved), 0)
             self.reserved += granted
@@ -709,10 +715,10 @@ class Scoreboard:
             self.score[result - 1] += 1
             for engine, kind in failures:
                 self.failures[kind][engine - 1] += 1
-            score = list(self.score)
+            score, pentanomial = list(self.score), list(self.pentanomial)
         logging.info('Total: {} W: {} L: {} D: {}{}{}'.format(
             sum(score), score[0], score[1], score[2], format_elo(score),
-            format_sprt(score, *self.elos) if self.elos else ''))
+            format_sprt(score, *self.elos, pentanomial) if self.elos else ''))
 
     def record_pair(self, first, second):
         """Counts a completed pair of games with swapped colors by the results of both games."""
@@ -741,7 +747,7 @@ class Scoreboard:
         except (ValueError, ZeroDivisionError):
             pass  # undefined, see format_elo
         if self.elos:
-            sprt_result = sprt(score, *self.elos)
+            sprt_result = sprt(score, *self.elos, pentanomial)
             result['sprt'] = {'elo0': self.elos[0], 'elo1': self.elos[1], 'llr': sprt_result['llr'],
                               'lower_bound': sprt_result['lower_bound'],
                               'upper_bound': sprt_result['upper_bound'],
@@ -751,11 +757,11 @@ class Scoreboard:
     def report(self):
         """Logs the final result, and how an SPRT test ended."""
         with self.lock:
-            score = list(self.score)
+            score, pentanomial = list(self.score), list(self.pentanomial)
         logging.info('Finished after {} games. W: {} L: {} D: {}{}'.format(
             sum(score), score[0], score[1], score[2], format_elo(score)))
         if self.elos:
-            state = sprt(score, *self.elos)['state']
+            state = sprt(score, *self.elos, pentanomial)['state']
             logging.info('SPRT [{:.2f},{:.2f}]: {}'.format(
                 self.elos[0], self.elos[1],
                 {'accepted': 'H1 accepted', 'rejected': 'H0 accepted'}.get(state, 'inconclusive')))

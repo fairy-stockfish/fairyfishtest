@@ -70,9 +70,9 @@ def report(total, elo0=None, elo1=None):
     lines.append('Time losses: {}  Crashes: {}  Illegal moves: {}  Engine restarts: {}  (engine 1, engine 2)'.format(
         total['time_losses'], total['crashes'], total['illegal_moves'], total['engine_restarts']))
     if elo0 is not None:
-        result = fairyfishtest.sprt(score, elo0, elo1)
+        result = fairyfishtest.sprt(score, elo0, elo1, total['pentanomial'])
         lines.append('SPRT [{:.2f},{:.2f}]:{} {}'.format(
-            elo0, elo1, fairyfishtest.format_sprt(score, elo0, elo1),
+            elo0, elo1, fairyfishtest.format_sprt(score, elo0, elo1, total['pentanomial']),
             {'accepted': 'H1 accepted', 'rejected': 'H0 accepted'}.get(result['state'], 'inconclusive')))
     return lines
 

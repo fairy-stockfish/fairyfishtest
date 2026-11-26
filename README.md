@@ -49,7 +49,7 @@ Every result line carries the Elo estimate, its 95% error bar and the [likelihoo
 Total: 100 W: 63 L: 34 D: 3 ELO: 103.73 +-71.1 (95%) LOS: 99.9%
 ```
 
-`-s/--sprt` stops the run as soon as a [sequential probability ratio test](https://en.wikipedia.org/wiki/Sequential_probability_ratio_test) can decide between the two hypotheses, rather than playing all `-n` games. `--elo0` is the null hypothesis and `--elo1` the alternative, defaulting to 0 and 10:
+`-s/--sprt` stops the run as soon as a [sequential probability ratio test](https://en.wikipedia.org/wiki/Sequential_probability_ratio_test) can decide between the two hypotheses, rather than playing all `-n` games. The test is run on the game pairs with swapped colors (a pentanomial generalized SPRT) whenever there are completed pairs, so it also works without draws, and falls back to a test on the single games otherwise. `--elo0` is the null hypothesis and `--elo1` the alternative, defaulting to 0 and 10:
 
 ```
 python fairyfishtest.py stockfish-test stockfish-base -v bughouse -n 5000 -t 10+0 -b books/bughouse.epd -s --elo0 0 --elo1 5
@@ -80,4 +80,4 @@ The base time has to be at least one second. Below that the `level` command anno
 python combine_results.py machine1.json machine2.json --elo0 0 --elo1 5
 ```
 
-It refuses to mix runs that differ in engines, variant, time control or book unless `--force` is given. The Elo estimate of the game pairs (pentanomial) is reported next to the one of the single games. The SPRT is run on the sum of the single games, like the one of `-s/--sprt`.
+It refuses to mix runs that differ in engines, variant, time control or book unless `--force` is given. The Elo estimate of the game pairs (pentanomial) is reported next to the one of the single games. The SPRT is run like the one of `-s/--sprt`: on the game pairs if there are any, and on the sum of the single games otherwise.

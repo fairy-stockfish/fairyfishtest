@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import random
 import sys
@@ -450,8 +451,8 @@ class TestStatistics(unittest.TestCase):
         self.assertIn('+-71.1 (95%)', fairyfishtest.format_elo([63, 34, 3]))
 
     def test_sprt(self):
-        # not enough of a spread to estimate drawelo yet
-        self.assertEqual(fairyfishtest.sprt([10, 0, 20], 0, 5)['llr'], 0.0)
+        # a sample of only wins and draws still has a likelihood ratio
+        self.assertGreater(fairyfishtest.sprt([10, 0, 20], 0, 5)['llr'], 0.0)
 
         undecided = fairyfishtest.sprt([716, 591, 2163], 0, 5)
         self.assertAlmostEqual(undecided['llr'], 2.5669, places=4)
@@ -460,11 +461,75 @@ class TestStatistics(unittest.TestCase):
         self.assertEqual(fairyfishtest.sprt([600, 400, 1000], 0, 5)['state'], 'accepted')
         self.assertEqual(fairyfishtest.sprt([400, 600, 1000], 0, 5)['state'], 'rejected')
 
+    def test_sprt_without_draws(self):
+        # wins and losses alone, as in variants that are hardly ever drawn
+        result = fairyfishtest.sprt([251, 49, 0], 0, 5)
+        self.assertAlmostEqual(result['llr'], 2.87595, places=4)
+        result = stat_util.SPRT({'wins': 251, 'losses': 49, 'draws': 0}, 0, 0.05, 100, 0.05)
+        self.assertEqual(result['state'], 'accepted')
+        # the binomial likelihood ratio, by hand
+        p0, p1 = (1 / (1 + 10 ** (-elo / 400)) for elo in (0, 100))
+        self.assertAlmostEqual(result['llr'], 251 * math.log(p1 / p0) + 49 * math.log((1 - p1) / (1 - p0)), places=9)
+
+    def test_sprt_degenerate(self):
+        # only wins, only losses
+        accepted = fairyfishtest.sprt([30, 0, 0], 0, 100)
+        self.assertEqual(accepted['state'], 'accepted')
+        self.assertGreater(accepted['llr'], 0)
+        self.assertEqual(fairyfishtest.sprt([0, 30, 0], 0, 100)['state'], 'rejected')
+        # nothing to tell the engines apart yet
+        self.assertEqual(fairyfishtest.sprt([0, 0, 0], 0, 5)['llr'], 0.0)
+        self.assertEqual(fairyfishtest.sprt([0, 0, 30], 0, 5)['llr'], 0.0)
+        self.assertEqual(stat_util.SPRT_pentanomial([0] * 5, 0, 0.05, 5, 0.05)['llr'], 0.0)
+
+    def test_sprt_pentanomial(self):
+        for pentanomial, llr, normalized_llr in (
+                ([1, 2, 6, 2, 1], -0.0049678, -0.0024850),
+                ([5, 20, 50, 30, 10], 0.5519574, 0.3933754),
+                ([0, 10, 200, 60, 0], 3.8571999, 1.9484744),
+                ([10, 40, 200, 100, 25], 3.1113829, 2.0491083)):
+            self.assertAlmostEqual(stat_util.LLR_pentanomial(pentanomial, 0, 5), llr, places=5)
+            self.assertAlmostEqual(stat_util.LLR_pentanomial(pentanomial, 0, 5, 'normalized'), normalized_llr, places=5)
+
+    def test_pentanomial_llr_properties(self):
+        # the normalized LLR is closed-form, N * ln((1 + (t - t0)^2) / (1 + (t - t1)^2))
+        pentanomial = [10, 40, 200, 100, 25]
+        n = sum(pentanomial)
+        mu = sum(c * points / 4 for points, c in enumerate(pentanomial)) / n
+        variance = sum(c * (points / 4 - mu) ** 2 for points, c in enumerate(pentanomial)) / n
+        t = (mu - 0.5) / math.sqrt(2 * variance)
+        t0, t1 = (elo * math.log(10) / 800 for elo in (0, 5))
+        self.assertAlmostEqual(stat_util.LLR_pentanomial(pentanomial, 0, 5, 'normalized'),
+                               n * math.log((1 + (t - t0) ** 2) / (1 + (t - t1) ** 2)), places=2)
+        # a sample at the midpoint of the hypotheses is neutral for the logistic test
+        self.assertAlmostEqual(stat_util.LLR_pentanomial([1, 2, 6, 2, 1], -5, 5), 0, places=6)
+        # the likelihood ratio flips its sign with the hypotheses
+        self.assertAlmostEqual(stat_util.LLR_pentanomial(pentanomial, 0, 5),
+                               -stat_util.LLR_pentanomial(pentanomial, 5, 0), places=9)
+        # the maximum likelihood estimate has the expected score of the hypothesis
+        _, pdf = stat_util._results_to_pdf(pentanomial)
+        for elo in (-20, 0, 15):
+            mle = stat_util._mle_expected(pdf, stat_util._logistic(elo))
+            self.assertAlmostEqual(sum(a * p for a, p in mle), stat_util._logistic(elo), places=9)
+            self.assertAlmostEqual(sum(p for _, p in mle), 1, places=9)
+        with self.assertRaises(ValueError):
+            stat_util.LLR_pentanomial(pentanomial, 0, 5, 'unknown')
+
+    def test_sprt_pentanomial_decides(self):
+        # no draws at all, but the pairs decide
+        stronger = stat_util.SPRT_pentanomial([0, 0, 0, 0, 300], 0, 0.05, 5, 0.05)
+        self.assertEqual(stronger['state'], 'accepted')
+        weaker = stat_util.SPRT_pentanomial([300, 0, 0, 0, 0], 0, 0.05, 5, 0.05)
+        self.assertEqual(weaker['state'], 'rejected')
+        # fairyfishtest.sprt prefers the pairs over the W/L/D score
+        self.assertAlmostEqual(fairyfishtest.sprt([0, 0, 0], 0, 5, [0, 10, 200, 60, 0])['llr'], 3.8572, places=4)
+        self.assertEqual(fairyfishtest.sprt([251, 49, 0], 0, 5, [0] * 5)['llr'],
+                         fairyfishtest.sprt([251, 49, 0], 0, 5)['llr'])
+
     def test_scoreboard_stops_on_sprt(self):
         scoreboard = fairyfishtest.Scoreboard(10000, (0, 5))
         # A clearly stronger engine 1, so the test accepts H1 well before the
-        # game limit. The results have to cover wins, losses and draws alike,
-        # since the test cannot estimate drawelo out of a sample without them.
+        # game limit.
         results = [1, 1, 0, -1]
         played = 0
         while scoreboard.reserve(1):

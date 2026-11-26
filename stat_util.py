@@ -103,18 +103,26 @@ def proba_to_bayeselo(probabilities):
     return elo_, drawelo
 
 
-def SPRT(R, elo0, alpha, elo1, beta, drawelo):
-    """Sequential probability ratio test of H0: elo = elo0 against H1: elo = elo1.
+# Replaces zero counts, so that the empirical distribution is regularized as in fishtest
+REGULARIZATION = 1e-3
 
-    alpha is the maximum type I error, reached at elo = elo0, and beta the
-    maximum type II error for elo >= elo1, reached at elo = elo1. R holds the
-    number of 'wins', 'losses' and 'draws'.
+# Normalized Elo per unit of normalized t-value, 800 / ln(10)
+NELO_DIVIDED_BY_NT = 800 / math.log(10)
 
-    Returns whether the test has 'finished', its 'state' ('accepted' for H1,
-    'rejected' for H0, or empty while it runs), the log-likelihood ratio 'llr'
-    and the 'lower_bound' and 'upper_bound' it is tested against.
-    """
-    result = {
+
+def _sprt_state(result):
+    """Fills in whether the test has finished and how, given its llr and bounds."""
+    if result['llr'] < result['lower_bound']:
+        result['finished'] = True
+        result['state'] = 'rejected'
+    elif result['llr'] > result['upper_bound']:
+        result['finished'] = True
+        result['state'] = 'accepted'
+    return result
+
+
+def _sprt_result(alpha, beta):
+    return {
         'finished': False,
         'state': '',
         'llr': 0.0,
@@ -122,26 +130,127 @@ def SPRT(R, elo0, alpha, elo1, beta, drawelo):
         'upper_bound': math.log((1 - beta) / alpha),
     }
 
-    # Estimate drawelo out of sample
-    if not (R['wins'] > 0 and R['losses'] > 0 and R['draws'] > 0):
+
+def SPRT(R, elo0, alpha, elo1, beta, drawelo=None):
+    """Sequential probability ratio test of H0: elo = elo0 against H1: elo = elo1, on single games.
+
+    alpha is the maximum type I error, reached at elo = elo0, and beta the
+    maximum type II error for elo >= elo1, reached at elo = elo1. R holds the
+    number of 'wins', 'losses' and 'draws'. The drawelo is estimated out of the
+    sample, so the drawelo argument is only kept for compatibility.
+
+    Without any draws the test is on wins and losses alone, with a drawelo of 0.
+    A missing win or loss count is regularized, so that the test also runs on
+    a sample of only wins or only losses.
+
+    Returns whether the test has 'finished', its 'state' ('accepted' for H1,
+    'rejected' for H0, or empty while it runs), the log-likelihood ratio 'llr'
+    and the 'lower_bound' and 'upper_bound' it is tested against.
+    """
+    result = _sprt_result(alpha, beta)
+    wins, losses, draws = float(R['wins']), float(R['losses']), float(R['draws'])
+    if wins + losses + draws == 0:
         return result
-    n = R['wins'] + R['losses'] + R['draws']
-    probabilities = {'win': float(R['wins']) / n, 'loss': float(R['losses']) / n, 'draw': float(R['draws']) / n}
-    _, drawelo = proba_to_bayeselo(probabilities)
+    if wins + losses == 0:
+        # Only draws, which tell nothing about the strength
+        return result
+    wins, losses = max(wins, REGULARIZATION), max(losses, REGULARIZATION)
+    n = wins + losses + draws
+    probabilities = {'win': wins / n, 'loss': losses / n, 'draw': draws / n}
+    if draws > 0:
+        _, drawelo = proba_to_bayeselo(probabilities)
+    else:
+        drawelo = 0.0
 
     # Probability laws under H0 and H1
     p0 = bayeselo_to_proba(elo0, drawelo)
     p1 = bayeselo_to_proba(elo1, drawelo)
 
-    result['llr'] = (R['wins'] * math.log(p1['win'] / p0['win'])
-                     + R['losses'] * math.log(p1['loss'] / p0['loss'])
-                     + R['draws'] * math.log(p1['draw'] / p0['draw']))
+    result['llr'] = (wins * math.log(p1['win'] / p0['win'])
+                     + losses * math.log(p1['loss'] / p0['loss']))
+    if draws > 0:
+        result['llr'] += draws * math.log(p1['draw'] / p0['draw'])
 
-    if result['llr'] < result['lower_bound']:
-        result['finished'] = True
-        result['state'] = 'rejected'
-    elif result['llr'] > result['upper_bound']:
-        result['finished'] = True
-        result['state'] = 'accepted'
+    return _sprt_state(result)
 
-    return result
+
+def _secular(pdf):
+    """Solves the secular equation sum_i p_i * a_i / (1 + x * a_i) = 0 for x."""
+    values = [a for a, _ in pdf]
+    v, w = min(values), max(values)
+    if v * w >= 0:
+        raise ValueError('the support of the distribution does not straddle the expectation')
+    epsilon = 1e-9
+    lower, upper = -1 / w + epsilon, -1 / v - epsilon
+
+    def f(x):
+        return sum(p * a / (1 + x * a) for a, p in pdf)
+
+    # f is strictly decreasing between its poles, so the root can be bisected
+    for _ in range(200):
+        middle = (lower + upper) / 2
+        if f(middle) > 0:
+            lower = middle
+        else:
+            upper = middle
+    return (lower + upper) / 2
+
+
+def _mle_expected(pdf, s):
+    """Maximum likelihood estimate of a distribution on the values of pdf with expectation s."""
+    x = _secular([(a - s, p) for a, p in pdf])
+    return [(a, p / (1 + x * (a - s))) for a, p in pdf]
+
+
+def _results_to_pdf(results):
+    """Turns counts into the empirical distribution of the score of a game (pair) in [0, 1]."""
+    counts = [max(float(count), REGULARIZATION) for count in results]
+    n = sum(counts)
+    return n, [(i / (len(counts) - 1), count / n) for i, count in enumerate(counts)]
+
+
+def _logistic(elo_):
+    return 1 / (1 + 10 ** (-elo_ / 400))
+
+
+def LLR_pentanomial(pentanomial, elo0, elo1, elo_model='logistic'):
+    """Generalized log-likelihood ratio of H1 against H0 for game pair counts.
+
+    The counts are those of game pairs with swapped colors by their points
+    (0, 0.5, 1, 1.5 and 2). Instead of assuming a model for the draws, the
+    likelihood of the observed distribution of the pair score is maximized
+    under both hypotheses (the GSPRT of Michel Van den Bergh, as in fishtest).
+
+    elo_model 'logistic' takes elo0 and elo1 as logistic Elo, i.e. as
+    hypotheses on the expected score. 'normalized' takes them as normalized
+    Elo, i.e. on the expected score in units of its standard deviation, with
+    the closed-form approximation of the generalized likelihood ratio.
+    """
+    if len(pentanomial) != 5:
+        raise ValueError('expected 5 pentanomial counts')
+    n, pdf = _results_to_pdf(pentanomial)
+    if elo_model == 'logistic':
+        pdf0, pdf1 = (_mle_expected(pdf, _logistic(elo)) for elo in (elo0, elo1))
+        return n * sum(p * (math.log(q1) - math.log(q0)) for (_, p), (_, q0), (_, q1) in zip(pdf, pdf0, pdf1))
+    if elo_model == 'normalized':
+        mu = sum(a * p for a, p in pdf)
+        variance = sum(p * (a - mu) ** 2 for a, p in pdf)
+        sigma_per_game = math.sqrt(2 * variance)
+        nt = (mu - 0.5) / sigma_per_game
+        nt0, nt1 = (elo / NELO_DIVIDED_BY_NT for elo in (elo0, elo1))
+        return n * math.log((1 + (nt - nt0) ** 2) / (1 + (nt - nt1) ** 2))
+    raise ValueError('unknown elo model: {}'.format(elo_model))
+
+
+def SPRT_pentanomial(pentanomial, elo0, alpha, elo1, beta, elo_model='logistic'):
+    """Sequential probability ratio test like SPRT, but on game pairs with swapped colors.
+
+    Both games of a pair start from the same position, so the pair is the
+    independent sample. This copes with draws of any frequency, including none.
+    pentanomial holds the counts of pairs by their points (0, 0.5, 1, 1.5, 2).
+    """
+    result = _sprt_result(alpha, beta)
+    if sum(pentanomial) == 0:
+        return result
+    result['llr'] = LLR_pentanomial(pentanomial, elo0, elo1, elo_model)
+    return _sprt_state(result)
