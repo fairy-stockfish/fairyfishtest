@@ -1,10 +1,12 @@
 import json
 import logging
 import os
+import re
 import random
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 import pyffish as sf
 
@@ -314,6 +316,51 @@ class TestMatchOutput(unittest.TestCase):
             moves = game.split('\n\n')[1].replace('\n', ' ')
             self.assertTrue(moves.startswith('1. '))
             self.assertTrue(moves.strip().endswith(('1-0', '0-1', '1/2-1/2', '*')))
+
+    def test_two_board_pgn_replays_with_transfers(self):
+        written = []
+        original = fairyfishtest.PgnWriter.format_game
+
+        def spy(writer, game, number, board=None):
+            written.append(game)
+            return original(writer, game, number, board)
+
+        # random games of bughouse can go on for very long, so this engine resigns early
+        source = XBOARD_ENGINE.replace('        legal = sf.legal', '        if len(moves) > 60:\n'
+                                       '            print("resign")\n            sys.stdout.flush()\n'
+                                       '            continue\n        legal = sf.legal', 1)
+        self.engine = write_script(self.directory, 'resigning-engine', source)
+        with unittest.mock.patch.object(fairyfishtest.PgnWriter, 'format_game', spy):
+            pgn, _ = self.run_match(2, variant='bughouse')
+        games = pgn.split('[Event ')[1:]
+        self.assertEqual(len(games), 4)
+        self.assertEqual(len(written), 4)
+        transfers = 0
+        for text, game in zip(games, written):
+            header, movetext = text.split('\n\n')[:2]
+            fen = re.search(r'\[FEN "([^"]*)"\]', header)
+            fen = fen.group(1) if fen else sf.start_fen('bughouse')
+            # the start position has the holdings of the start, not the received ones
+            self.assertEqual(fen, game.start_fen)
+            moves = []
+            for token in re.findall(r'\{[^}]*\}|\S+', movetext):
+                held = re.fullmatch(r'\{\[%holding \+(\w+)\]\}', token)
+                if held:
+                    transfers += 1
+                    board, rest = sf.get_fen('bughouse', fen, moves).split('[', 1)
+                    fen, moves = board + '[' + rest.split(']', 1)[0] + held.group(1) + ']' + rest.split(']', 1)[1], []
+                elif not token.startswith('{') and not re.fullmatch(r'\d+\.+|1-0|0-1|1/2-1/2|\*', token):
+                    # the SAN move has to be legal with the pieces received so far
+                    legal = [m for m in sf.legal_moves('bughouse', fen, moves)
+                             if sf.get_san('bughouse', sf.get_fen('bughouse', fen, moves), m) == token]
+                    self.assertEqual(len(legal), 1, token)
+                    moves.append(legal[0])
+            replayed = sf.get_fen('bughouse', fen, moves)
+            expected = sf.get_fen('bughouse', game.get_start_fen(), game.moves)
+            self.assertEqual(replayed.split()[0:2], expected.split()[0:2])
+            self.assertEqual(sorted(replayed.split('[')[1].split(']')[0]),
+                             sorted(expected.split('[')[1].split(']')[0]))
+        self.assertGreater(transfers, 0)
 
     def test_result_tag(self):
         game = fairyfishtest.Game.__new__(fairyfishtest.Game)
