@@ -359,6 +359,9 @@ class Game:
         self.failure = None
         self.partner = None
         self.obtained_holdings = ''
+        # The pieces received from the partner board as (number of moves played
+        # on this board at the time, pieces), for the PGN
+        self.transfers = []
         self.clock_times = [self.time_control.time, self.time_control.time]
         self.lock = threading.RLock()
 
@@ -508,6 +511,7 @@ class Game:
     def set_holdings(self, captured):
         with self.lock:
             self.obtained_holdings += captured
+            self.transfers.append((len(self.moves), captured))
             holdings = self.get_holdings()
         white_holdings = ''.join(filter(str.isupper, holdings)).upper()
         black_holdings = ''.join(filter(str.islower, holdings)).upper()
@@ -616,7 +620,11 @@ class PgnWriter:
         first_black = start_fen.split()[1] == 'b'
         fullmove = int(start_fen.split()[-1]) if start_fen.split()[-1].isdigit() else 1
         tokens = []
+        with game.lock:
+            transfers = list(game.transfers)
         for ply, move in enumerate(moves):
+            # Pieces that arrived before this move, in the case of the side receiving them
+            tokens += ['{{[%holding +{}]}}'.format(pieces) for count, pieces in transfers if count == ply]
             black = (ply + first_black) % 2
             if not black:
                 tokens.append('{}.'.format(fullmove + (ply + first_black) // 2))
@@ -627,6 +635,8 @@ class PgnWriter:
                 clock = max(game.move_clocks[ply], 0)
                 tokens.append('{{[%clk {}:{:02d}:{:06.3f}]}}'.format(
                     int(clock // 3600), int(clock // 60 % 60), clock % 60))
+        # Pieces that arrived after the last move
+        tokens += ['{{[%holding +{}]}}'.format(pieces) for count, pieces in transfers if count >= len(moves)]
         tokens.append(self.result_tag(game))
         lines, line = [], ''
         for token in tokens:
@@ -656,8 +666,10 @@ class PgnWriter:
             ('Variant', self.variant),
             ('TimeControl', str(self.time_control)),
         ]
-        if game.get_start_fen() != sf.start_fen(self.variant):
-            tags += [('FEN', game.get_start_fen()), ('SetUp', '1')]
+        # The true start position: the holdings the partner board passes on
+        # are recorded in the movetext, where they arrived
+        if game.start_fen != sf.start_fen(self.variant):
+            tags += [('FEN', game.start_fen), ('SetUp', '1')]
         if termination:
             tags.append(('Termination', termination))
         if board:
