@@ -64,6 +64,25 @@ def get_elo(wld):
     return elo(mu), (elo(mu_max) - elo(mu_min)) / 2, phi((mu - 0.5) / stdev)
 
 
+def get_elo_pentanomial(pentanomial):
+    """Returns the Elo difference, its 95% error bar and the likelihood of superiority.
+
+    The counts are those of game pairs with swapped colors by their points
+    (0, 0.5, 1, 1.5 and 2). Both games of a pair start from the same position,
+    so the pair is the independent sample, which gives a tighter and fairer
+    error bar than treating all games as independent when the openings differ
+    in how much they favor either color.
+    """
+    n = sum(pentanomial)
+    scores = [points / 4 for points in range(5)]
+    probabilities = [float(count) / n for count in pentanomial]
+    mu = sum(p * score for p, score in zip(probabilities, scores))
+    stdev = math.sqrt(sum(p * (score - mu) ** 2 for p, score in zip(probabilities, scores))) / math.sqrt(n)
+    mu_min = mu + phi_inv(0.025) * stdev
+    mu_max = mu + phi_inv(0.975) * stdev
+    return elo(mu), (elo(mu_max) - elo(mu_min)) / 2, phi((mu - 0.5) / stdev)
+
+
 def bayeselo_to_proba(elo_, drawelo):
     """Turns an Elo expressed in BayesElo, relative to drawelo, into win/loss/draw probabilities."""
     probabilities = {

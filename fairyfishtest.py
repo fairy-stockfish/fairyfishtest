@@ -19,6 +19,8 @@
 import argparse
 from collections import Counter
 import contextlib
+import datetime
+import json
 import logging
 import math
 import os
@@ -27,6 +29,7 @@ import random
 import subprocess
 import threading
 import time
+import uuid
 
 import pyffish as sf
 
@@ -40,6 +43,9 @@ MOVE_TIMEOUT_GRACE = 10
 # Error rates and the drawelo the SPRT is run with, as in fishtest.
 SPRT_ALPHA = SPRT_BETA = 0.05
 SPRT_DRAWELO = 200
+
+# The ways an engine can fail to play on, which the results count per engine
+FAILURE_KINDS = ('time', 'crash', 'illegal')
 
 # How often a match replaces the process of an engine that died before it gives
 # up, so that a reproducibly crashing engine does not restart forever.
@@ -337,13 +343,20 @@ class TimeControl:
 
 
 class Game:
-    def __init__(self, engine1, engine2, time_control, variant='chess', start_fen=None):
+    def __init__(self, engine1, engine2, time_control, variant='chess', start_fen=None, engine_ids=(1, 2)):
         self.engines = [engine1, engine2]
+        # Which of the two competing engines (1 or 2) plays which side of the board
+        self.engine_ids = engine_ids
         self.time_control = time_control
         self.variant = variant
         self.start_fen = start_fen or sf.start_fen(variant)
         self.moves = []
+        self.move_clocks = []  # the clock of the mover after each move
         self.result = None
+        # How the game ended, for the PGN, and the engine that failed to play on,
+        # if any, as (index into engines, 'time', 'crash' or 'illegal')
+        self.termination = None
+        self.failure = None
         self.partner = None
         self.obtained_holdings = ''
         self.clock_times = [self.time_control.time, self.time_control.time]
@@ -371,16 +384,23 @@ class Game:
                 logging.warning('Engine {} loses on time.'.format((len(self.moves) - 1) % 2 + 1))
                 result = 1
                 game_end = True
+                self.termination = 'time forfeit'
+                self.failure = ((len(self.moves) - 1) % 2, 'time')
             elif self.moves and not self.is_legal():
                 # last move was illegal
                 result = 1
                 game_end = True
                 logging.error('Illegal move: {}'.format(self.moves[-1]))
+                self.termination = 'illegal move'
+                self.failure = ((len(self.moves) - 1) % 2, 'illegal')
             elif not sf.legal_moves(self.variant, self.get_start_fen(), self.moves):
                 game_end = True
                 result = sf.game_result(self.variant, self.get_start_fen(), self.moves)
+                self.termination = 'normal'
             else:
                 game_end, result = sf.is_optional_game_end(self.variant, self.get_start_fen(), self.moves)
+                if game_end:
+                    self.termination = 'adjudication'
             if game_end:
                 self.result = int(math.copysign(1, result if len(self.moves) % 2 == 0 else -result)) if result else result
             return game_end
@@ -429,6 +449,7 @@ class Game:
             with self.lock:
                 self.moves.append(move)
                 self.clock_times[idx] += self.time_control.increment - (end_time - start_time)
+                self.move_clocks.append(self.clock_times[idx])
                 start_fen, current_moves = self.get_start_fen(), list(self.moves)
             logging.debug('Position: {}, Move: {}'.format(sf.get_fen(self.variant, start_fen, current_moves[:-1]), move))
             if self.partner and move in sf.legal_moves(self.variant, start_fen, current_moves[:-1]):
@@ -448,37 +469,28 @@ class Game:
                 result = 1 if (claim == '1-0') == first_is_white else -1
             with self.lock:
                 self.result = result
+                self.termination = 'result claim'
             return
+        failure = None
         if kind == 'timeout':
             logging.warning('Engine {} did not move in time.'.format(idx + 1))
+            failure, termination = 'time', 'time forfeit'
         elif kind == 'eof':
             logging.error('Engine {} died.'.format(idx + 1))
-        elif kind == 'resign':
-            logging.info('Engine {} resigns.'.format(idx + 1))
+            failure, termination = 'crash', 'engine crash'
+        else:
+            if kind == 'resign':
+                logging.info('Engine {} resigns.'.format(idx + 1))
+            termination = 'resignation'
         # The engine to move loses. Game.result is from engines[0]'s point of view.
         with self.lock:
             self.result = -1 if idx == 0 else 1
+            self.termination = termination
+            if failure:
+                self.failure = (idx, failure)
 
     def get_captured(self, start_fen, moves):
-        previous_fen = sf.get_fen(self.variant, start_fen, moves[:-1])
-        current_fen = sf.get_fen(self.variant, start_fen, moves)
-        piece_filter = str.isupper if current_fen.split()[1] == 'w' else str.islower
-        previous_pieces = self.count_pieces(previous_fen.split()[0], piece_filter)
-        current_pieces = self.count_pieces(current_fen.split()[0], piece_filter)
-        return ''.join((previous_pieces - current_pieces).elements())
-
-    @staticmethod
-    def count_pieces(board, piece_filter):
-        """Counts the pieces of one side on the board, demoting promoted ones.
-
-        Promoted pieces are marked with a trailing '~' in the FEN. Capturing one
-        of them yields a pawn, so that is what has to be passed to the partner.
-        """
-        pieces = Counter()
-        for piece, suffix in zip(board, board[1:] + ' '):
-            if piece_filter(piece):
-                pieces[('P' if piece.isupper() else 'p') if suffix == '~' else piece] += 1
-        return pieces
+        return get_captured(self.variant, start_fen, moves)
 
     def get_start_fen(self):
         if self.partner:
@@ -507,6 +519,29 @@ class Game:
             engine.holding(xboard_holdings)
 
 
+def count_pieces(board, piece_filter):
+    """Counts the pieces of one side on the board, demoting promoted ones.
+
+    Promoted pieces are marked with a trailing '~' in the FEN. Capturing one
+    of them yields a pawn, so that is what has to be passed to the partner.
+    """
+    pieces = Counter()
+    for piece, suffix in zip(board, board[1:] + ' '):
+        if piece_filter(piece):
+            pieces[('P' if piece.isupper() else 'p') if suffix == '~' else piece] += 1
+    return pieces
+
+
+def get_captured(variant, start_fen, moves):
+    """The pieces the last move captured, in the case of the color that lost them."""
+    previous_fen = sf.get_fen(variant, start_fen, moves[:-1])
+    current_fen = sf.get_fen(variant, start_fen, moves)
+    piece_filter = str.isupper if current_fen.split()[1] == 'w' else str.islower
+    previous_pieces = count_pieces(previous_fen.split()[0], piece_filter)
+    current_pieces = count_pieces(current_fen.split()[0], piece_filter)
+    return ''.join((previous_pieces - current_pieces).elements())
+
+
 def sprt(score, elo0, elo1):
     """Runs the sequential probability ratio test on a W/L/D score."""
     return stat_util.SPRT({'wins': score[0], 'losses': score[1], 'draws': score[2]},
@@ -533,6 +568,107 @@ def format_sprt(score, elo0, elo1):
         result['llr'], result['lower_bound'], result['upper_bound'], elo0, elo1)
 
 
+class PgnWriter:
+    """Appends the games of a run to a PGN file.
+
+    A two-board game is written as one PGN game per board. The two carry the
+    same Pair tag, which is unique across runs, and tell the boards apart by
+    their Board tag.
+    """
+
+    def __init__(self, path, names, time_control, variant):
+        self.path = path
+        self.names = names
+        self.time_control = time_control
+        self.variant = variant
+        self.run_id = uuid.uuid4().hex[:8]
+        self.games = 0
+        self.lock = threading.Lock()
+        # Start a fresh file rather than appending to the games of an earlier run
+        open(path, 'w').close()
+
+    def next_game(self):
+        """Claims the number of the next game, or pair of games."""
+        with self.lock:
+            self.games += 1
+            return self.games
+
+    @staticmethod
+    def result_tag(game):
+        if game.result is None:
+            return '*'
+        white_result = game.result if game.get_start_fen().split()[1] == 'w' else -game.result
+        return {1: '1-0', -1: '0-1', 0: '1/2-1/2'}[white_result]
+
+    def movetext(self, game):
+        start_fen = game.get_start_fen()
+        try:
+            moves = sf.get_san_moves(game.variant, start_fen, game.moves)
+        except Exception:  # noqa: BLE001 - a game is better saved in UCI than not at all
+            logging.warning('Could not convert the moves to SAN, writing them as UCI.')
+            moves = list(game.moves)
+        first_black = start_fen.split()[1] == 'b'
+        fullmove = int(start_fen.split()[-1]) if start_fen.split()[-1].isdigit() else 1
+        tokens = []
+        for ply, move in enumerate(moves):
+            black = (ply + first_black) % 2
+            if not black:
+                tokens.append('{}.'.format(fullmove + (ply + first_black) // 2))
+            elif not ply:
+                tokens.append('{}...'.format(fullmove))
+            tokens.append(move)
+            if ply < len(game.move_clocks):
+                clock = max(game.move_clocks[ply], 0)
+                tokens.append('{{[%clk {}:{:02d}:{:06.3f}]}}'.format(
+                    int(clock // 3600), int(clock // 60 % 60), clock % 60))
+        tokens.append(self.result_tag(game))
+        lines, line = [], ''
+        for token in tokens:
+            if line and len(line) + 1 + len(token) > 80:
+                lines.append(line)
+                line = token
+            else:
+                line = (line + ' ' + token) if line else token
+        lines.append(line)
+        return '\n'.join(lines)
+
+    def format_game(self, game, number, board=None):
+        first_white = game.get_start_fen().split()[1] == 'w'
+        first, second = (self.names[engine_id - 1] for engine_id in game.engine_ids)
+        white, black = (first, second) if first_white else (second, first)
+        termination = game.termination
+        if game.result is None and game.partner:
+            termination = 'partner board ended'
+        tags = [
+            ('Event', 'fairyfishtest {}'.format(self.variant)),
+            ('Site', 'localhost'),
+            ('Date', datetime.date.today().strftime('%Y.%m.%d')),
+            ('Round', str(number)),
+            ('White', white),
+            ('Black', black),
+            ('Result', self.result_tag(game)),
+            ('Variant', self.variant),
+            ('TimeControl', str(self.time_control)),
+        ]
+        if game.get_start_fen() != sf.start_fen(self.variant):
+            tags += [('FEN', game.get_start_fen()), ('SetUp', '1')]
+        if termination:
+            tags.append(('Termination', termination))
+        if board:
+            tags += [('Board', str(board)), ('Pair', '{}-{}'.format(self.run_id, number))]
+        header = '\n'.join('[{} "{}"]'.format(name, str(value).replace('\\', '\\\\').replace('"', '\\"'))
+                           for name, value in tags)
+        return header + '\n\n' + self.movetext(game) + '\n\n'
+
+    def write(self, number, game, game2=None):
+        """Appends a finished game, and the game on the second board if there is one."""
+        text = (self.format_game(game, number, 1) + self.format_game(game2, number, 2) if game2
+                else self.format_game(game, number))
+        with self.lock:
+            with open(self.path, 'a') as pgn:
+                pgn.write(text)
+
+
 class Scoreboard:
     """The W/L/D counters and the stop condition shared by all concurrent matches.
 
@@ -545,6 +681,10 @@ class Scoreboard:
         self.games = games
         self.elos = elos
         self.score = [0, 0, 0]
+        # Game pairs by their points for engine 1: 0, 0.5, 1, 1.5 and 2
+        self.pentanomial = [0] * 5
+        # How often each engine (index 0 and 1) failed to play on, by kind
+        self.failures = {kind: [0, 0] for kind in FAILURE_KINDS}
         self.reserved = 0
         self.stopped = False
         self.lock = threading.Lock()
@@ -563,13 +703,50 @@ class Scoreboard:
         with self.lock:
             self.reserved -= count
 
-    def record(self, result):
+    def record(self, result, failures=()):
+        """Counts a result from engine 1's point of view and the (engine, kind) failures behind it."""
         with self.lock:
             self.score[result - 1] += 1
+            for engine, kind in failures:
+                self.failures[kind][engine - 1] += 1
             score = list(self.score)
         logging.info('Total: {} W: {} L: {} D: {}{}{}'.format(
             sum(score), score[0], score[1], score[2], format_elo(score),
             format_sprt(score, *self.elos) if self.elos else ''))
+
+    def record_pair(self, first, second):
+        """Counts a completed pair of games with swapped colors by the results of both games."""
+        with self.lock:
+            self.pentanomial[first + second + 2] += 1
+
+    def to_dict(self):
+        """The results in the machine-readable form that --json writes and combine_results.py sums up."""
+        with self.lock:
+            score, pentanomial = list(self.score), list(self.pentanomial)
+            failures = {kind: list(counts) for kind, counts in self.failures.items()}
+        result = {
+            'games': sum(score),
+            'wins': score[0],
+            'losses': score[1],
+            'draws': score[2],
+            'pentanomial': pentanomial,
+            'pairs': sum(pentanomial),
+            'time_losses': failures['time'],
+            'crashes': failures['crash'],
+            'illegal_moves': failures['illegal'],
+        }
+        try:
+            elo, elo95, los = stat_util.get_elo(score)
+            result.update({'elo': elo, 'elo95': elo95, 'los': los})
+        except (ValueError, ZeroDivisionError):
+            pass  # undefined, see format_elo
+        if self.elos:
+            sprt_result = sprt(score, *self.elos)
+            result['sprt'] = {'elo0': self.elos[0], 'elo1': self.elos[1], 'llr': sprt_result['llr'],
+                              'lower_bound': sprt_result['lower_bound'],
+                              'upper_bound': sprt_result['upper_bound'],
+                              'state': sprt_result['state']}
+        return result
 
     def report(self):
         """Logs the final result, and how an SPRT test ended."""
@@ -591,7 +768,7 @@ class Scoreboard:
 
 class Match:
     def __init__(self, engine1, engine2, e1_options, e2_options, time_control, variant='chess',
-                 scoreboard=None, start_fens=None, name='match', max_restarts=MAX_ENGINE_RESTARTS):
+                 scoreboard=None, start_fens=None, name='match', max_restarts=MAX_ENGINE_RESTARTS, pgn=None):
         self.two_boards = sf.two_boards(variant)
         self.name = name
         # The names end up on the engines' reader threads, so that the log of a
@@ -607,6 +784,7 @@ class Match:
         self.start_fens = start_fens if start_fens else [sf.start_fen(variant)]
         self.max_restarts = max_restarts
         self.restarts = 0
+        self.pgn = pgn
         for engine in self.all_engines():
             engine.initialize()
 
@@ -644,14 +822,17 @@ class Match:
     def play_game(self, flip, start_fen):
         """Plays one game and returns its result from engine 1's point of view.
 
+        The result comes with the failures behind it, as (engine, kind) pairs
+        with the engine numbered 1 and 2, see FAILURE_KINDS.
+
         Both boards of a two-board variant start from the same position, the
         way a real bughouse game does.
         """
         game = Game(self.engines[flip], self.engines[not flip], self.time_control,
-                    self.variant, start_fen)
+                    self.variant, start_fen, (2, 1) if flip else (1, 2))
         if self.two_boards:
             game2 = Game(self.board2_engines[not flip], self.board2_engines[flip], self.time_control,
-                         self.variant, start_fen)
+                         self.variant, start_fen, (1, 2) if flip else (2, 1))
             game.partner = game2
             game2.partner = game
             self.engines[0].partner = self.board2_engines[0]
@@ -691,7 +872,11 @@ class Match:
             result = game.result
         assert result in (1, 0, -1)
         logging.debug('Game finished after {} moves.'.format(len(game.moves)))
-        return -result if flip else result
+        boards = [game, game2] if self.two_boards else [game]
+        failures = [(board.engine_ids[board.failure[0]], board.failure[1]) for board in boards if board.failure]
+        if self.pgn:
+            self.pgn.write(self.pgn.next_game(), game, game2 if self.two_boards else None)
+        return (-result if flip else result), failures
 
     def run(self):
         """Plays games until the scoreboard is exhausted.
@@ -704,14 +889,18 @@ class Match:
             if not games:
                 break
             start_fen = random.choice(self.start_fens)
+            results = []
             for flip in range(games):
                 try:
                     self.restart_dead_engines()
-                    result = self.play_game(flip, start_fen)
+                    result, failures = self.play_game(flip, start_fen)
                 except BaseException:
                     self.scoreboard.release(games - flip)
                     raise
-                self.scoreboard.record(result)
+                self.scoreboard.record(result, failures)
+                results.append(result)
+            if len(results) == 2:
+                self.scoreboard.record_pair(*results)
 
 
 def book_path(book, variant):
@@ -774,19 +963,40 @@ def run_match(match, errors):
         match.scoreboard.stop()
 
 
+def engine_names(engine1, engine2, name1=None, name2=None):
+    """Names the engines for the PGN, from their file names unless given, and keeps the two apart."""
+    names = [name1 or os.path.basename(engine1), name2 or os.path.basename(engine2)]
+    if names[0] == names[1]:
+        names = ['{} ({})'.format(name, number) for number, name in enumerate(names, start=1)]
+    return names
+
+
+def write_json(path, scoreboard, info):
+    """Writes the results machine-readably, replacing the file only once it is complete."""
+    result = dict(info, **scoreboard.to_dict())
+    with open(path + '.tmp', 'w') as output:
+        json.dump(result, output, indent=2, sort_keys=True)
+        output.write('\n')
+    os.replace(path + '.tmp', path)
+
+
 def main(engine1, engine2, e1_options, e2_options, time_control, variant, num_games, concurrency,
-         book, sprt, elo0, elo1, **kwargs):
+         book, sprt, elo0, elo1, pgn_file=None, json_file=None, e1_name=None, e2_name=None, **kwargs):
     time_control.warn_if_inexact()
     warn_if_oversubscribed(variant, concurrency)
     start_fens = load_book(book, variant) if book else None
     scoreboard = Scoreboard(num_games, (elo0, elo1) if sprt else None)
+    names = engine_names(engine1, engine2, e1_name, e2_name)
+    pgn = PgnWriter(pgn_file, names, time_control, variant) if pgn_file else None
     errors = []
+    matches = []
     with contextlib.ExitStack() as stack:
         threads = []
         for i in range(concurrency):
             name = 'match{}'.format(i + 1)
             match = stack.enter_context(Match(engine1, engine2, dict(e1_options), dict(e2_options),
-                                              time_control, variant, scoreboard, start_fens, name))
+                                              time_control, variant, scoreboard, start_fens, name, pgn=pgn))
+            matches.append(match)
             threads.append(threading.Thread(target=run_match, args=(match, errors), name=name, daemon=True))
         for thread in threads:
             thread.start()
@@ -799,6 +1009,18 @@ def main(engine1, engine2, e1_options, e2_options, time_control, variant, num_ga
             for thread in threads:
                 thread.join()
     scoreboard.report()
+    if json_file:
+        write_json(json_file, scoreboard, {
+            'version': 1,
+            'engine1': names[0],
+            'engine2': names[1],
+            'variant': variant,
+            'time_control': str(time_control),
+            'book': os.path.basename(book_path(book, variant)) if book else None,
+            'concurrency': concurrency,
+            'engine_restarts': sum(match.restarts for match in matches),
+            'error': str(errors[0]) if errors else None,
+        })
     if errors:
         raise errors[0]
 
@@ -816,6 +1038,12 @@ if __name__ == '__main__':
     parser.add_argument('-c', '--concurrency', type=int, default=1, help='number of games to play concurrently')
     parser.add_argument('-b', '--book', nargs='?', const=True,
                         help='EPD opening book, or the variant book in books/ if given without a path')
+    parser.add_argument('--pgn', dest='pgn_file', metavar='FILE',
+                        help='write the games to a PGN file, one game per board for two-board variants')
+    parser.add_argument('--json', dest='json_file', metavar='FILE',
+                        help='write the results to a JSON file that combine_results.py can sum up')
+    parser.add_argument('--e1-name', help='name of the first engine in the PGN and JSON, default: file name')
+    parser.add_argument('--e2-name', help='name of the second engine in the PGN and JSON, default: file name')
     parser.add_argument('-s', '--sprt', action='store_true', help='stop as soon as an SPRT test concludes')
     parser.add_argument('--elo0', type=float, default=0, help='null hypothesis of the SPRT test')
     parser.add_argument('--elo1', type=float, default=10, help='alternative hypothesis of the SPRT test')

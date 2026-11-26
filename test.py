@@ -1,8 +1,16 @@
+import json
 import logging
+import os
+import random
 import sys
+import tempfile
 import unittest
 
+import pyffish as sf
+
+import combine_results
 import fairyfishtest
+import make_book
 import stat_util
 
 
@@ -14,6 +22,61 @@ IDLE_ENGINE = [sys.executable, '-c', 'import sys\nfor line in sys.stdin:\n'
 # talking without dying
 MUTE_ENGINE = [sys.executable, '-c', 'import os, sys\nos.close(1)\nfor line in sys.stdin:\n'
                '    if line.strip() == "quit": break']
+# A UCI engine that evaluates every position as the score given by its first
+# argument, in a stand-in for an engine that can search
+UCI_ENGINE = '''import sys
+for line in sys.stdin:
+    line = line.strip()
+    if line == "uci":
+        print("uciok")
+    elif line == "isready":
+        print("readyok")
+    elif line.startswith("go"):
+        print("info depth 1 score cp " + sys.argv[1])
+        print("bestmove 0000")
+    elif line == "quit":
+        break
+    sys.stdout.flush()
+'''
+
+# An xboard engine that plays random legal moves, for matches without a real engine
+XBOARD_ENGINE = '''import random, sys
+import pyffish as sf
+variant, fen, moves, playing = "chess", None, [], False
+for line in sys.stdin:
+    command = line.split()
+    if not command:
+        continue
+    if command[0] in ("new", "force"):
+        playing = False
+        if command[0] == "new":
+            fen, moves = None, []
+    elif command[0] == "variant":
+        variant = command[1]
+    elif command[0] == "setboard":
+        fen = line.split(None, 1)[1].strip()
+    elif command[0] in ("usermove", "go"):
+        if command[0] == "usermove":
+            moves.append(command[1])
+        else:
+            playing = True
+        start = fen or sf.start_fen(variant)
+        legal = sf.legal_moves(variant, start, moves) if playing else []
+        if legal:
+            moves.append(random.choice(legal))
+            print("move " + moves[-1])
+            sys.stdout.flush()
+    elif command[0] == "quit":
+        break
+'''
+
+
+def write_script(directory, name, source):
+    path = os.path.join(directory, name)
+    with open(path, 'w') as script:
+        script.write('#!{}\n{}'.format(sys.executable, source))
+    os.chmod(path, 0o755)
+    return path
 
 
 class TestFairyFishTest(unittest.TestCase):
@@ -206,6 +269,165 @@ class TestScoreboard(unittest.TestCase):
         for result in (1, 1, -1, 0):
             scoreboard.record(result)
         self.assertEqual(scoreboard.score, [2, 1, 1])
+
+
+class TestMatchOutput(unittest.TestCase):
+    """Plays real matches between random movers, and checks what they write."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = directory.name
+        self.engine = write_script(self.directory, 'random-engine', XBOARD_ENGINE)
+
+    def run_match(self, games, variant='micro', **kwargs):
+        pgn = os.path.join(self.directory, 'games.pgn')
+        result = os.path.join(self.directory, 'result.json')
+        with self.assertLogs(level=logging.INFO):
+            fairyfishtest.main(self.engine, self.engine, {}, {}, fairyfishtest.TimeControl(10), variant,
+                               games, 1, None, False, 0, 10, pgn_file=pgn, json_file=result, **kwargs)
+        with open(pgn) as pgn_file, open(result) as result_file:
+            return pgn_file.read(), json.load(result_file)
+
+    def test_pgn_and_json(self):
+        pgn, result = self.run_match(4)
+        self.assertEqual(result['games'], 4)
+        self.assertEqual(result['wins'] + result['losses'] + result['draws'], 4)
+        # two pairs of games with swapped colors
+        self.assertEqual(result['pairs'], 2)
+        self.assertEqual(sum(result['pentanomial']), 2)
+        self.assertEqual(result['engine1'], 'random-engine (1)')
+        self.assertEqual(result['time_losses'], [0, 0])
+        self.assertEqual(result['crashes'], [0, 0])
+        self.assertEqual(result['variant'], 'micro')
+        self.assertEqual(pgn.count('[Event '), 4)
+        self.assertEqual(pgn.count('[Variant "micro"]'), 4)
+        self.assertEqual(pgn.count('[Pair '), 0)
+        # the engines swap colors from one game of a pair to the next
+        self.assertIn('[White "random-engine (1)"]', pgn)
+        self.assertIn('[White "random-engine (2)"]', pgn)
+        self.assertIn('[%clk ', pgn)
+
+    def test_pgn_moves_replay(self):
+        pgn, _ = self.run_match(2)
+        for game in pgn.split('[Event ')[1:]:
+            moves = game.split('\n\n')[1].replace('\n', ' ')
+            self.assertTrue(moves.startswith('1. '))
+            self.assertTrue(moves.strip().endswith(('1-0', '0-1', '1/2-1/2', '*')))
+
+    def test_result_tag(self):
+        game = fairyfishtest.Game.__new__(fairyfishtest.Game)
+        game.start_fen = 'k7/8/8/8/8/8/8/K7 b - - 0 1'
+        game.partner = None
+        for result, tag in ((1, '0-1'), (-1, '1-0'), (0, '1/2-1/2'), (None, '*')):
+            game.result = result
+            self.assertEqual(fairyfishtest.PgnWriter.result_tag(game), tag)
+
+    def test_engine_names(self):
+        self.assertEqual(fairyfishtest.engine_names('/a/sf', '/b/sf'), ['sf (1)', 'sf (2)'])
+        self.assertEqual(fairyfishtest.engine_names('/a/new', '/b/old'), ['new', 'old'])
+        self.assertEqual(fairyfishtest.engine_names('/a/sf', '/b/sf', 'A', 'B'), ['A', 'B'])
+
+
+class TestFailureStatistics(unittest.TestCase):
+    def test_record_failures(self):
+        scoreboard = fairyfishtest.Scoreboard(4)
+        scoreboard.record(-1, [(1, 'time')])
+        scoreboard.record(1, [(2, 'crash'), (2, 'time')])
+        result = scoreboard.to_dict()
+        self.assertEqual(result['time_losses'], [1, 1])
+        self.assertEqual(result['crashes'], [0, 1])
+        self.assertEqual(result['illegal_moves'], [0, 0])
+        self.assertEqual((result['wins'], result['losses'], result['draws']), (1, 1, 0))
+
+    def test_pentanomial(self):
+        scoreboard = fairyfishtest.Scoreboard(8)
+        for first, second in ((-1, -1), (-1, 0), (0, 0), (1, -1), (0, 1), (1, 1), (1, 1)):
+            scoreboard.record_pair(first, second)
+        self.assertEqual(scoreboard.to_dict()['pentanomial'], [1, 1, 2, 1, 2])
+
+    def test_game_failure_of_the_engine_that_lost_on_time(self):
+        game = fairyfishtest.Game(None, None, fairyfishtest.TimeControl(10), 'chess', None, (2, 1))
+        game.moves = ['e2e4']
+        game.clock_times = [-1, 10]
+        self.assertTrue(game.is_game_end())
+        self.assertEqual(game.failure, (0, 'time'))
+        self.assertEqual(game.engine_ids[game.failure[0]], 2)
+
+
+class TestCombineResults(unittest.TestCase):
+    RESULT = {'engine1': 'a', 'engine2': 'b', 'variant': 'chess', 'time_control': '10+0', 'book': None,
+              'wins': 10, 'losses': 5, 'draws': 5, 'pairs': 10, 'pentanomial': [1, 2, 3, 2, 2],
+              'time_losses': [1, 0], 'crashes': [0, 2], 'illegal_moves': [0, 0], 'engine_restarts': 1}
+
+    def test_combine(self):
+        total = combine_results.combine([self.RESULT, self.RESULT])
+        self.assertEqual((total['wins'], total['losses'], total['draws'], total['games']), (20, 10, 10, 40))
+        self.assertEqual(total['pentanomial'], [2, 4, 6, 4, 4])
+        self.assertEqual(total['time_losses'], [2, 0])
+        self.assertEqual(total['crashes'], [0, 4])
+        self.assertEqual(total['engine_restarts'], 2)
+
+    def test_mismatches(self):
+        self.assertEqual(combine_results.mismatches([self.RESULT, self.RESULT]), [])
+        other = dict(self.RESULT, variant='crazyhouse')
+        self.assertEqual(combine_results.mismatches([self.RESULT, other]), ['variant: chess, crazyhouse'])
+
+    def test_report(self):
+        total = combine_results.combine([self.RESULT, self.RESULT])
+        lines = combine_results.report(total, 0, 5)
+        self.assertIn('Total: 40 W: 20 L: 10 D: 10', lines[0])
+        self.assertTrue(lines[1].startswith('Pairs: 20 [2, 4, 6, 4, 4] ELO: '))
+        self.assertIn('Time losses: [2, 0]', lines[2])
+        self.assertTrue(lines[3].startswith('SPRT [0.00,5.00]: LLR: '))
+
+    def test_pentanomial_elo(self):
+        elo, _, los = stat_util.get_elo_pentanomial([1, 2, 6, 2, 1])
+        self.assertAlmostEqual(elo, 0, places=6)
+        self.assertAlmostEqual(los, 0.5, places=6)
+        elo, elo95, los = stat_util.get_elo_pentanomial([1, 2, 3, 6, 8])
+        self.assertGreater(elo, 0)
+        self.assertGreater(los, 0.95)
+
+
+class TestMakeBook(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = directory.name
+
+    def test_random_opening(self):
+        rng = random.Random(1)
+        for variant in ('chess', 'crazyhouse', 'bughouse'):
+            fens = [make_book.random_opening(variant, 6, rng) for _ in range(20)]
+            fens = [fen for fen in fens if fen]
+            self.assertTrue(fens)
+            for fen in fens:
+                self.assertEqual(sf.validate_fen(fen, variant), sf.FEN_OK)
+                self.assertTrue(sf.legal_moves(variant, fen, []))
+
+    def test_bughouse_holdings_hold_the_captures(self):
+        rng = random.Random(3)
+        fens = [make_book.random_opening('bughouse', 10, rng) for _ in range(200)]
+        fens = [fen for fen in fens if fen]
+        self.assertTrue(all(']' in fen for fen in fens))
+        self.assertTrue(any(not fen.split('[')[1].startswith(']') for fen in fens))
+
+    def test_generate_filters_by_score(self):
+        def factory(score):
+            path = write_script(self.directory, 'uci-{}'.format(score), UCI_ENGINE)
+            wrapper = write_script(self.directory, 'run-{}'.format(score),
+                                   'import os, sys\nos.execv({!r}, [{!r}, {!r}])\n'.format(path, path, str(score)))
+            return lambda: make_book.UciEngine(wrapper, 'chess')
+
+        book, _ = make_book.generate(factory(30), 'chess', 5, 4, 6, 100, 'go depth 1', random.Random(0))
+        self.assertEqual(len(book), 5)
+        self.assertEqual(len(set(book)), 5)
+        # an engine that sees every position as lost leaves nothing to keep
+        book, attempts = make_book.generate(factory(500), 'chess', 5, 4, 6, 100, 'go depth 1',
+                                            random.Random(0), max_attempts=20)
+        self.assertEqual(book, [])
+        self.assertEqual(attempts, 20)
 
 
 class TestStatistics(unittest.TestCase):
